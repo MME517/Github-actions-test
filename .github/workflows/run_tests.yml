@@ -56,7 +56,7 @@ jobs:
         if: ${{ github.event.inputs.language == 'cpp' }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y lcov gcovr cmake clang llvm
+          sudo apt-get install -y lcov gcovr cmake clang llvm libcurl4-openssl-dev
           # Install mull (mutation testing for LLVM)
           curl -L https://github.com/mull-project/mull/releases/latest/download/mull-11.0.0-Ubuntu-20.04.deb -o mull.deb
           sudo dpkg -i mull.deb || true
