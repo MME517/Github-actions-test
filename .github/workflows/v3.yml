@@ -276,4 +276,3 @@ jobs:
         with:
           name: metrics
           path: metrics.json
-```
