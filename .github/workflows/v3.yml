@@ -1,5 +1,4 @@
-name: Human Test Metrics (execute PR human tests)
-
+name: Human Test Metrics v3
 on:
   workflow_dispatch:
     inputs:
