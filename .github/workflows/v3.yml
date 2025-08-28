@@ -50,8 +50,8 @@ jobs:
         if: ${{ github.event.inputs.language == 'python' }}
         run: |
           set -o pipefail
-          pytest --cov=. --cov-report=xml:coverage.xml || echo "TESTS_FAILED" > test_fail.txt
-          mutmut run --CI || echo "MUTATION_FAILED" > mutation_fail.txt
+          pytest --cov=. --cov-report=xml:coverage.xml --cov-context=test || echo "TESTS_FAILED" > test_fail.txt
+          mutmut run  || echo "MUTATION_FAILED" > mutation_fail.txt
           flake8 --select=PT --exit-zero tests/ > test_smells.txt || true
 
       # --- C++ ---
