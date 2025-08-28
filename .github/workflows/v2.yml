@@ -324,7 +324,7 @@ jobs:
               json.dump(result, f, indent=2)
 
           print(json.dumps(result, indent=2))
-        shell: python3
+       
 
       - name: Upload metrics.json
         uses: actions/upload-artifact@v4
