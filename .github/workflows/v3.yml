@@ -47,13 +47,23 @@ jobs:
         run: |
           pip install -r requirements.txt pytest pytest-cov mutmut lxml flake8 flake8-pytest-style
 
+      - name: Debug coverage configuration
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          echo "Coverage configuration:"
+          coverage debug sys
+          echo "Checking for configuration files:"
+          find . -name "pytest.ini" -o -name ".coveragerc" -o -name "setup.cfg" -o -name "tox.ini"
+          cat pytest.ini || echo "No pytest.ini found"
+          cat .coveragerc || echo "No .coveragerc found"
+
       - name: Run Python tests
         if: ${{ github.event.inputs.language == 'python' }}
         run: |
           set -o pipefail
-          pytest --cov=. --cov-report=xml:coverage.xml --cov-context=test > pytest_output.txt 2>&1 || echo "TESTS_FAILED" > test_fail.txt
+          pytest --cov=. --cov-report=xml:coverage.xml > pytest_output.txt 2>&1 || echo "TESTS_FAILED" > test_fail.txt
           mutmut run --runner "pytest" || echo "MUTATION_FAILED" > mutation_fail.txt
-          mutmut results --xml > mutations.xml || true
+          mutmut results > mutations.txt || true
           flake8 --select=PT --exit-zero tests/ > test_smells.txt || true
 
       - name: Upload test output
@@ -211,35 +221,22 @@ jobs:
                       pass
 
           # --- Python Mutation (mutmut) ---
-          mutmut_files = glob.glob("**/mutations.xml", recursive=True)
-          if mutmut_files:
+          mutmut_db = glob.glob("**/mutmut-cache", recursive=True)
+          if mutmut_db:
               try:
-                  tree = ET.parse(mutmut_files[0])
-                  root = tree.getroot()
-                  muts = root.findall(".//mutation")
-                  killed = sum(1 for m in muts if m.find("status").text.lower() == "killed")
-                  total = len(muts)
+                  conn = sqlite3.connect(mutmut_db[0])
+                  cursor = conn.cursor()
+                  cursor.execute("SELECT status FROM mutant WHERE status IN ('killed', 'survived')")
+                  results = cursor.fetchall()
+                  total = len(results)
+                  killed = sum(1 for r in results if r[0] == 'killed')
                   if total > 0:
                       mutation = killed * 100.0 / total
+                  conn.close()
               except Exception as e:
-                  print(f"Failed to parse mutmut mutations.xml: {e}")
+                  print(f"Failed to parse mutmut database: {e}")
           else:
-              mutmut_db = glob.glob("**/mutmut-cache", recursive=True)
-              if mutmut_db:
-                  try:
-                      conn = sqlite3.connect(mutmut_db[0])
-                      cursor = conn.cursor()
-                      cursor.execute("SELECT status FROM mutant WHERE status IN ('killed', 'survived')")
-                      results = cursor.fetchall()
-                      total = len(results)
-                      killed = sum(1 for r in results if r[0] == 'killed')
-                      if total > 0:
-                          mutation = killed * 100.0 / total
-                      conn.close()
-                  except Exception as e:
-                      print(f"Failed to parse mutmut database: {e}")
-              else:
-                  print("No mutation files or database found for mutmut")
+              print("No mutmut database found")
 
           # --- Test Smells ---
           test_smells = None
