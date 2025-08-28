@@ -1,0 +1,346 @@
+name: Human Test Metrics (execute PR human tests)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository (e.g. owner/name)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+      language:
+        description: "Language (python | cpp | java | kotlin | go)"
+        required: true
+        type: choice
+        options: [python, cpp, java, kotlin, go]
+
+jobs:
+  test-metrics:
+    runs-on: ubuntu-latest
+    env:
+      LANG: C.UTF-8
+
+    steps:
+      # --- Checkout PR code (use /merge to test integration; switch to /head if you want raw PR head) ---
+      - name: Checkout PR (with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Show repo snapshot (debug)
+        run: |
+          echo "=== repo: ${{ github.event.inputs.repo }} PR: ${{ github.event.inputs.pr_number }} LANG: ${{ github.event.inputs.language }} ==="
+          git rev-parse --abbrev-ref HEAD || true
+          git submodule status || true
+          ls -la || true
+          mkdir -p reports
+
+      # --- Base tools used across languages ---
+      - name: Install base tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential cmake lcov gcovr curl unzip jq clang llvm clang-tidy cppcheck maven gradle
+
+      # =========================== PYTHON ===========================
+      - name: Setup Python
+        if: ${{ github.event.inputs.language == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Python tests & metrics
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          set -o pipefail
+          python -m pip install --upgrade pip || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          pip install pytest pytest-cov mutmut pylint || true
+
+          # Execute human tests from PR
+          pytest --junitxml=reports/pytest-junit.xml --cov=. --cov-report=xml:reports/coverage.xml
+          if [ "$?" -eq 0 ]; then echo "EXECUTION_SUCCESS=1" >> $GITHUB_ENV; else echo "EXECUTION_SUCCESS=0" >> $GITHUB_ENV; fi
+          echo "COMPILATION_SUCCESS=1" >> $GITHUB_ENV  # Python has no compile step
+
+          # Mutation testing (best-effort)
+          mutmut run --CI || true
+          mutmut results --summary > reports/mutmut-summary.txt 2>/dev/null || true
+
+          # Test smells (only test files)
+          TESTFILES=$(git ls-files 'tests/**/*.py' 'tests/*.py' 'test_*.py' '*_test.py' || true)
+          if [ -n "$TESTFILES" ]; then pylint $TESTFILES > reports/test_smells.txt || true; else echo "NO_TEST_FILES" > reports/test_smells.txt; fi
+
+      # =========================== C++ ===========================
+      - name: C++ build, test, coverage & mutation
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          set -eo pipefail
+          echo "COMPILATION_SUCCESS=0" >> $GITHUB_ENV
+          echo "EXECUTION_SUCCESS=0" >> $GITHUB_ENV
+
+          # Install mull (best-effort)
+          curl -sL "https://github.com/mull-project/mull/releases/latest/download/mull-11.0.0-Ubuntu-20.04.deb" -o mull.deb || true
+          sudo dpkg -i mull.deb || true
+
+          # Configure with coverage + compile_commands for clang-tidy
+          mkdir -p build
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_FLAGS="--coverage" \
+            -DCMAKE_CXX_FLAGS="--coverage" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage" || { echo "CMake configure failed" > reports/build_errors.txt; exit 0; }
+
+          cmake --build build -- -j"$(nproc)" || { echo "Build failed" > reports/build_errors.txt; exit 0; }
+          echo "COMPILATION_SUCCESS=1" >> $GITHUB_ENV
+
+          # Run tests (ctest if present)
+          (cd build && ctest --output-on-failure) && echo "EXECUTION_SUCCESS=1" >> $GITHUB_ENV || echo "EXECUTION_SUCCESS=0" >> $GITHUB_ENV
+
+          # Coverage (Cobertura XML via gcovr)
+          gcovr --root . --object-directory build --xml -o reports/coverage.xml || true
+
+          # Mutation testing (best-effort)
+          if command -v mull-runner >/dev/null 2>&1; then
+            (cd build && mull-runner . --reporters=IDE --output=../reports/mutations.json) || true
+          fi
+
+          # Test smells (target test files only, using compile db)
+          cp build/compile_commands.json ./compile_commands.json || true
+          find . -type f \( -name "*test*.cpp" -o -name "*_test.cpp" -o -path "*/tests/*.cpp" \) > test_files.txt || true
+          if [ -s test_files.txt ]; then
+            # Use -p build so clang-tidy can find includes/flags
+            clang-tidy -p build @test_files.txt > reports/test_smells.txt 2>&1 || true
+          else
+            echo "NO_TEST_FILES" > reports/test_smells.txt
+          fi
+
+      # =========================== JAVA / KOTLIN ===========================
+      - name: Setup JDK
+        if: ${{ github.event.inputs.language == 'java' || github.event.inputs.language == 'kotlin' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: JVM build, test, coverage & mutation
+        if: ${{ github.event.inputs.language == 'java' || github.event.inputs.language == 'kotlin' }}
+        run: |
+          set -o pipefail
+          echo "COMPILATION_SUCCESS=0" >> $GITHUB_ENV
+          echo "EXECUTION_SUCCESS=0" >> $GITHUB_ENV
+
+          if [ -f pom.xml ]; then
+            echo "Using Maven"
+            mvn -B -e -DskipTests=true package && echo "COMPILATION_SUCCESS=1" >> $GITHUB_ENV || true
+            mvn -B -e test && echo "EXECUTION_SUCCESS=1" >> $GITHUB_ENV || true
+            mvn -B -e jacoco:report || true
+            mvn -B -e org.pitest:pitest-maven:mutationCoverage -DoutputFormats=XML || true
+            # Test smells
+            mvn -B -e pmd:pmd pmd:cpd || true
+            # copy reports
+            find target -name "jacoco*.xml" -maxdepth 2 -print -exec cp {} reports/coverage.xml \; -quit || true
+            find target/pit-reports -name mutations.xml -print -exec cp {} reports/pitest-mutations.xml \; -quit || true
+            if [ -f target/pmd.xml ]; then cp target/pmd.xml reports/test_smells.xml || true; fi
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ] || [ -f gradlew ]; then
+            echo "Using Gradle"
+            [ -f gradlew ] && chmod +x ./gradlew
+            ./gradlew -q assemble && echo "COMPILATION_SUCCESS=1" >> $GITHUB_ENV || true
+            ./gradlew -q test && echo "EXECUTION_SUCCESS=1" >> $GITHUB_ENV || true
+            ./gradlew -q jacocoTestReport || true
+            # Kotlin projects might use Kover
+            ./gradlew -q koverXmlReport || true
+            # PIT (if plugin applied)
+            ./gradlew -q pitest || true
+            # detekt (if plugin applied)
+            ./gradlew -q detekt || true
+            # copy reports
+            find build/reports -name "jacocoTestReport.xml" -print -exec cp {} reports/coverage.xml \; -quit || true
+            find build/reports/kover -name "*.xml" -print -exec cp {} reports/coverage.xml \; -quit || true
+            find build/reports/pitest -name "mutations.xml" -print -exec cp {} reports/pitest-mutations.xml \; -quit || true
+            if [ -f build/reports/detekt/detekt.xml ]; then cp build/reports/detekt/detekt.xml reports/test_smells.xml || true; fi
+          else
+            echo "No Maven/Gradle build files found" > reports/build_errors.txt
+          fi
+
+      # =========================== GO ===========================
+      - name: Setup Go
+        if: ${{ github.event.inputs.language == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Go build, test, coverage & mutation
+        if: ${{ github.event.inputs.language == 'go' }}
+        run: |
+          set -o pipefail
+          echo "COMPILATION_SUCCESS=0" >> $GITHUB_ENV
+          echo "EXECUTION_SUCCESS=0" >> $GITHUB_ENV
+          if [ -f go.mod ]; then go mod download || true; fi
+
+          go build ./... && echo "COMPILATION_SUCCESS=1" >> $GITHUB_ENV || true
+          go test ./... -coverprofile=reports/coverage.out && echo "EXECUTION_SUCCESS=1" >> $GITHUB_ENV || true
+          if [ -f reports/coverage.out ]; then go tool cover -func=reports/coverage.out -o reports/coverage.txt || true; fi
+
+          # Mutation (best-effort)
+          go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest || true
+          if [ -x "$(go env GOPATH)/bin/go-mutesting" ]; then $(go env GOPATH)/bin/go-mutesting ./... --json > reports/go-mutesting.json || true; fi
+
+          # Test smells
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.59.0 || true
+          $(go env GOPATH)/bin/golangci-lint run ./... > reports/test_smells.txt || true
+
+      # =========================== Parse & Normalize ===========================
+      - name: Parse and normalize metrics into metrics.json
+        run: |
+          python3 - <<'PY'
+          import json, os, glob, xml.etree.ElementTree as ET, re
+
+          repo = "${{ github.event.inputs.repo }}"
+          pr = "${{ github.event.inputs.pr_number }}"
+          lang = "${{ github.event.inputs.language }}"
+
+          def parse_cobertura_or_jacoco(path):
+              try:
+                  tree = ET.parse(path); root = tree.getroot()
+                  # Cobertura
+                  if 'line-rate' in root.attrib:
+                      return float(root.attrib['line-rate']) * 100.0
+                  # JaCoCo/Kover counters
+                  cnt = root.findall(".//counter[@type='LINE']")
+                  if cnt:
+                      c = cnt[0]; covered = int(c.attrib.get('covered',0)); missed = int(c.attrib.get('missed',0))
+                      return covered * 100.0 / (covered + missed) if (covered + missed) > 0 else None
+              except Exception:
+                  return None
+              return None
+
+          coverage = None
+          mutation = None
+
+          # Coverage candidates
+          cov_candidates = []
+          cov_candidates += glob.glob("reports/coverage.xml")
+          cov_candidates += glob.glob("**/jacoco*.xml", recursive=True)
+          cov_candidates += glob.glob("**/kover*.xml", recursive=True)
+          cov_candidates += glob.glob("**/coverage*.xml", recursive=True)
+
+          for p in cov_candidates:
+              v = parse_cobertura_or_jacoco(p)
+              if v is not None:
+                  coverage = v
+                  break
+
+          # Go coverage (from `go tool cover -func`)
+          if coverage is None and os.path.exists("reports/coverage.txt"):
+              with open("reports/coverage.txt") as f:
+                  for line in f:
+                      if line.strip().startswith("total:"):
+                          m = re.search(r"total:\s*\(statements\)\s*([\d\.]+)%", line)
+                          if not m:
+                              m = re.search(r"total:\s*([\d\.]+)%", line)
+                          if m:
+                              coverage = float(m.group(1))
+                              break
+
+          # Mutation: PIT (Java/Kotlin)
+          pit = glob.glob("**/pitest-mutations.xml", recursive=True) + glob.glob("**/pitest*/mutations.xml", recursive=True) + glob.glob("reports/pitest-mutations.xml")
+          if not pit:
+              pit = glob.glob("**/mutations.xml", recursive=True)  # generic fallback
+          for p in pit:
+              try:
+                  tree = ET.parse(p); muts = tree.findall(".//mutation")
+                  total = len(muts)
+                  killed = sum(1 for m in muts if (m.find("status") is not None and m.find("status").text == "KILLED"))
+                  if total > 0: mutation = killed * 100.0 / total
+                  if mutation is not None: break
+              except Exception:
+                  pass
+
+          # Mutation: C++ (mull)
+          for p in glob.glob("reports/mutations.json") + glob.glob("**/mutations.json", recursive=True):
+              try:
+                  with open(p) as f:
+                      data = json.load(f)
+                  mutants = data.get("mutants") or data.get("results") or []
+                  total = len(mutants)
+                  killed = sum(1 for m in mutants if str(m.get("status","")).lower() == "killed")
+                  if total > 0:
+                      mutation = killed * 100.0 / total
+                      break
+              except Exception:
+                  pass
+
+          # Mutation: Go (go-mutesting)
+          for p in glob.glob("reports/go-mutesting.json") + glob.glob("**/go-mutesting*.json", recursive=True):
+              try:
+                  with open(p) as f: data = json.load(f)
+                  total = len(data); killed = sum(1 for m in data if str(m.get("status","")).lower() == "killed")
+                  if total > 0:
+                      mutation = killed * 100.0 / total
+                      break
+              except Exception:
+                  pass
+
+          # Mutation: Python (mutmut summary)
+          if mutation is None:
+              for p in glob.glob("reports/mutmut-summary.txt") + glob.glob(".mutmut-cache/*", recursive=True):
+                  try:
+                      with open(p, errors="ignore") as f: s = f.read()
+                      m = re.search(r'Killed:\s*(\d+).*?Total:\s*(\d+)', s, re.S)
+                      if m:
+                          killed = int(m.group(1)); total = int(m.group(2))
+                          if total > 0:
+                              mutation = killed * 100.0 / total
+                              break
+                  except Exception:
+                      pass
+
+          # Compilation & Execution success from env flags
+          compilation_success = (os.getenv("COMPILATION_SUCCESS") == "1") if os.getenv("COMPILATION_SUCCESS") else (not os.path.exists("reports/build_errors.txt"))
+          execution_success = (os.getenv("EXECUTION_SUCCESS") == "1") if os.getenv("EXECUTION_SUCCESS") else True
+
+          # Test smells (text or xml -> string)
+          smells = None
+          for p in ["reports/test_smells.txt", "reports/test_smells.xml"]:
+              if os.path.exists(p):
+                  with open(p, errors="replace") as f:
+                      smells = f.read()[:20000]
+                  break
+
+          result = {
+              "repo": repo,
+              "pr_number": pr,
+              "language": lang,
+              "coverage": round(coverage, 2) if isinstance(coverage, (int, float)) else None,
+              "mutation_score": round(mutation, 2) if isinstance(mutation, (int, float)) else None,
+              "compilation_success": bool(compilation_success),
+              "execution_success": bool(execution_success),
+              "test_smells": smells
+          }
+
+          with open("metrics.json","w") as f:
+              json.dump(result, f, indent=2)
+
+          print("== Final Metrics ==")
+          print(json.dumps(result, indent=2))
+          PY
+
+      # --- Upload artifacts ---
+      - name: Upload metrics.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: metrics.json
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: reports
