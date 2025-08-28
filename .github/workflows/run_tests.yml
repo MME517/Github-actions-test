@@ -1,0 +1,205 @@
+name: Human Test Metrics
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository (e.g. owner/name)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+      language:
+        description: "Project language"
+        required: true
+        type: choice
+        options:
+          - python
+          - cpp
+          - java
+          - kotlin
+          - go
+
+jobs:
+  test-metrics:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
+          fetch-depth: 0
+
+      # --- Python ---
+      - name: Setup Python
+        if: ${{ github.event.inputs.language == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: pip install -r requirements.txt pytest pytest-cov mutmut lxml
+
+      - name: Run Python tests
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          pytest --cov=. --cov-report=xml
+          mutmut run --CI
+
+      # --- C++ ---
+      - name: Install C++ tools
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lcov gcovr cmake clang llvm
+          # Install mull (mutation testing for LLVM)
+          curl -L https://github.com/mull-project/mull/releases/latest/download/mull-11.0.0-Ubuntu-20.04.deb -o mull.deb
+          sudo dpkg -i mull.deb || true
+
+      - name: Build & Test C++ with coverage
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_CXX_FLAGS="--coverage"
+          make
+          ctest || true
+          gcovr -r .. --xml -o coverage.xml || true
+          mull-runner . --reporters=IDE --output=mutations.json || true
+
+      # --- Java ---
+      - name: Setup JDK
+        if: ${{ github.event.inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Run Java tests
+        if: ${{ github.event.inputs.language == 'java' }}
+        run: |
+          mvn clean test jacoco:report
+          mvn org.pitest:pitest-maven:mutationCoverage
+
+      # --- Kotlin ---
+      - name: Setup JDK for Kotlin
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Run Kotlin tests
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        run: |
+          ./gradlew test koverXmlReport
+          ./gradlew pitest
+
+      # --- Go ---
+      - name: Setup Go
+        if: ${{ github.event.inputs.language == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Run Go tests
+        if: ${{ github.event.inputs.language == 'go' }}
+        run: |
+          go test ./... -coverprofile=coverage.out
+          go tool cover -func=coverage.out -o coverage.txt
+          go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest
+          $(go env GOPATH)/bin/go-mutesting ./... || true
+
+      # --- Normalize Results ---
+      - name: Parse and summarize metrics
+        run: |
+          python <<'EOF'
+          import json, os, glob, xml.etree.ElementTree as ET
+
+          language = "${{ github.event.inputs.language }}"
+          coverage = None
+          mutation = None
+
+          # Parse coverage XML (Cobertura / JaCoCo / Kover / gcovr)
+          cobertura_files = glob.glob("**/coverage*.xml", recursive=True) + glob.glob("**/cobertura-coverage.xml", recursive=True)
+          if cobertura_files:
+              try:
+                  tree = ET.parse(cobertura_files[0])
+                  root = tree.getroot()
+                  if 'line-rate' in root.attrib:
+                      coverage = float(root.attrib['line-rate']) * 100
+              except Exception:
+                  pass
+
+          jacoco_files = glob.glob("**/jacoco*.xml", recursive=True)
+          if jacoco_files:
+              tree = ET.parse(jacoco_files[0])
+              counters = tree.findall(".//counter[@type='LINE']")
+              if counters:
+                  c = counters[0]
+                  covered = int(c.attrib['covered'])
+                  missed = int(c.attrib['missed'])
+                  coverage = covered * 100.0 / (covered + missed)
+
+          kover_files = glob.glob("**/kover.xml", recursive=True)
+          if kover_files:
+              tree = ET.parse(kover_files[0])
+              counters = tree.findall(".//counter[@type='LINE']")
+              if counters:
+                  c = counters[0]
+                  covered = int(c.attrib['covered'])
+                  missed = int(c.attrib['missed'])
+                  coverage = covered * 100.0 / (covered + missed)
+
+          # Mutation reports
+          pitest_files = glob.glob("**/pit-reports/**/mutations.xml", recursive=True)
+          if pitest_files:
+              tree = ET.parse(pitest_files[0])
+              muts = tree.findall(".//mutation")
+              killed = sum(1 for m in muts if m.find("status").text == "KILLED")
+              total = len(muts)
+              if total > 0:
+                  mutation = killed * 100.0 / total
+
+          mull_json = glob.glob("**/mutations.json", recursive=True)
+          if mull_json:
+              with open(mull_json[0]) as f:
+                  data = json.load(f)
+                  total = len(data.get("mutants", []))
+                  killed = sum(1 for m in data.get("mutants", []) if m.get("status") == "Killed")
+                  if total > 0:
+                      mutation = killed * 100.0 / total
+
+          go_mutation = glob.glob("**/mutest.json", recursive=True)
+          if go_mutation:
+              with open(go_mutation[0]) as f:
+                  data = json.load(f)
+                  killed = sum(1 for m in data if m.get("status") == "killed")
+                  total = len(data)
+                  if total > 0:
+                      mutation = killed * 100.0 / total
+
+          result = {
+              "repo": "${{ github.event.inputs.repo }}",
+              "pr_number": "${{ github.event.inputs.pr_number }}",
+              "language": language,
+              "coverage": coverage,
+              "mutation_score": mutation
+          }
+
+          with open("metrics.json", "w") as f:
+              json.dump(result, f, indent=2)
+
+          print("== Final Metrics ==")
+          print(json.dumps(result, indent=2))
+          EOF
+
+      - name: Upload metrics.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: metrics.json
