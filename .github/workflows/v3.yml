@@ -1,4 +1,3 @@
-
 name: Human Test Metrics v3
 
 on:
@@ -26,6 +25,7 @@ on:
 jobs:
   test-metrics:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout PR code
@@ -35,64 +35,211 @@ jobs:
           ref: refs/pull/${{ github.event.inputs.pr_number }}/head
           fetch-depth: 0
 
-      # --- Python ---
+      # =======================
+      # Python Configuration
+      # =======================
       - name: Setup Python
         if: ${{ github.event.inputs.language == 'python' }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Python deps
+      - name: Install Python dependencies
         if: ${{ github.event.inputs.language == 'python' }}
         run: |
-          pip install -r requirements.txt pytest pytest-cov mutmut lxml flake8 flake8-pytest-style
+          # Update pip and install wheel
+          pip install --upgrade pip wheel setuptools
+          
+          # Check for various requirements files
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          elif [ -f "requirements/requirements.txt" ]; then
+            pip install -r requirements/requirements.txt
+          elif [ -f "setup.py" ]; then
+            pip install -e .
+          elif [ -f "pyproject.toml" ]; then
+            pip install -e .
+          fi
+          
+          # Install testing tools
+          pip install pytest pytest-cov coverage mutmut lxml flake8 flake8-pytest-style
 
-      - name: Debug coverage configuration
+      - name: Debug Python coverage configuration
         if: ${{ github.event.inputs.language == 'python' }}
         run: |
-          echo "Coverage configuration:"
+          echo "=== Coverage configuration ==="
           coverage debug sys
-          echo "Checking for configuration files:"
-          find . -name "pytest.ini" -o -name ".coveragerc" -o -name "setup.cfg" -o -name "tox.ini"
-          cat pytest.ini || echo "No pytest.ini found"
-          cat .coveragerc || echo "No .coveragerc found"
+          echo ""
+          echo "=== Configuration files ==="
+          for file in pytest.ini .coveragerc setup.cfg tox.ini pyproject.toml; do
+            if [ -f "$file" ]; then
+              echo "Found: $file"
+              head -20 "$file"
+              echo "---"
+            fi
+          done
+          
+          # Find test directories
+          echo "=== Test directories ==="
+          find . -type d -name "test*" -o -name "*test" | head -10
 
-      - name: Run Python tests
+      - name: Run Python tests with coverage
         if: ${{ github.event.inputs.language == 'python' }}
         run: |
-          set -o pipefail
-          pytest --cov=. --cov-report=xml:coverage.xml > pytest_output.txt 2>&1 || echo "TESTS_FAILED" > test_fail.txt
-          mutmut run --runner "pytest" || echo "MUTATION_FAILED" > mutation_fail.txt
-          mutmut results > mutations.txt || true
-          flake8 --select=PT --exit-zero tests/ > test_smells.txt || true
+          set +e  # Don't exit on error
+          
+          # Find test directory
+          TEST_DIR=""
+          for dir in tests test testing; do
+            if [ -d "$dir" ]; then
+              TEST_DIR="$dir"
+              break
+            fi
+          done
+          
+          # If no test directory found, search for test files
+          if [ -z "$TEST_DIR" ]; then
+            TEST_FILES=$(find . -name "*test*.py" -o -name "test_*.py" | head -20)
+            if [ -n "$TEST_FILES" ]; then
+              TEST_DIR="."
+            fi
+          fi
+          
+          echo "Test directory/files: $TEST_DIR"
+          
+          # Run pytest with coverage
+          if [ -n "$TEST_DIR" ]; then
+            pytest "$TEST_DIR" \
+              --cov=. \
+              --cov-report=xml:coverage.xml \
+              --cov-report=term \
+              --tb=short \
+              -v > pytest_output.txt 2>&1
+            TEST_EXIT_CODE=$?
+          else
+            echo "No tests found" > pytest_output.txt
+            TEST_EXIT_CODE=1
+          fi
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "TESTS_FAILED" > test_fail.txt
+            cat pytest_output.txt
+          fi
+          
+          # Run mutation testing
+          if [ -n "$TEST_DIR" ] && [ $TEST_EXIT_CODE -eq 0 ]; then
+            echo "Running mutation testing..."
+            mutmut run \
+              --runner "pytest $TEST_DIR -q" \
+              --paths-to-mutate . \
+              --tests-dir "$TEST_DIR" \
+              --simple-output \
+              2>&1 | tee mutmut_output.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+            
+            # Generate mutation results
+            mutmut results > mutations.txt 2>&1 || true
+            mutmut show all > mutations_detailed.txt 2>&1 || true
+          fi
+          
+          # Detect test smells
+          if [ -n "$TEST_DIR" ]; then
+            flake8 --select=PT --exit-zero "$TEST_DIR" > test_smells.txt 2>&1 || true
+          fi
 
-      - name: Upload test output
-        if: ${{ github.event.inputs.language == 'python' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: pytest-output
-          path: pytest_output.txt
-
-      # --- C++ ---
+      # =======================
+      # C++ Configuration
+      # =======================
       - name: Install C++ tools
         if: ${{ github.event.inputs.language == 'cpp' }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y lcov gcovr cmake clang llvm libcurl4-openssl-dev
-          curl -L https://github.com/mull-project/mull/releases/latest/download/mull-11.0.0-Ubuntu-20.04.deb -o mull.deb
-          sudo dpkg -i mull.deb || true
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            lcov \
+            gcovr \
+            clang \
+            llvm \
+            libcurl4-openssl-dev \
+            libgtest-dev \
+            libgmock-dev
+          
+          # Try to install mull for mutation testing
+          if ! command -v mull-runner &> /dev/null; then
+            curl -L https://github.com/mull-project/mull/releases/download/11.0.0/mull-11.0.0-Ubuntu-20.04.deb \
+              -o mull.deb 2>/dev/null || true
+            sudo dpkg -i mull.deb 2>/dev/null || true
+            sudo apt-get install -f -y || true
+          fi
 
-      - name: Build & Test C++ with coverage
+      - name: Build and test C++ with coverage
         if: ${{ github.event.inputs.language == 'cpp' }}
         run: |
-          mkdir build && cd build
-          cmake .. -DCMAKE_CXX_FLAGS="--coverage"
-          make || echo "BUILD_FAILED" > ../build_fail.txt
-          ctest || echo "TESTS_FAILED" > ../test_fail.txt
-          gcovr -r .. --xml -o ../coverage.xml || true
-          mull-runner . --reporters=IDE --output=../mutations.json || true
+          set +e
+          
+          # Create build directory
+          mkdir -p build && cd build
+          
+          # Configure with coverage flags
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="--coverage -g -O0 -fprofile-arcs -ftest-coverage" \
+            -DCMAKE_C_FLAGS="--coverage -g -O0 -fprofile-arcs -ftest-coverage" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
+            2>&1 | tee cmake_output.txt
+          
+          CMAKE_EXIT_CODE=$?
+          if [ $CMAKE_EXIT_CODE -ne 0 ]; then
+            echo "BUILD_FAILED" > ../build_fail.txt
+            exit 0
+          fi
+          
+          # Build the project
+          make -j$(nproc) 2>&1 | tee make_output.txt
+          MAKE_EXIT_CODE=$?
+          if [ $MAKE_EXIT_CODE -ne 0 ]; then
+            echo "BUILD_FAILED" > ../build_fail.txt
+            exit 0
+          fi
+          
+          # Run tests
+          if command -v ctest &> /dev/null; then
+            ctest --output-on-failure -V 2>&1 | tee ctest_output.txt
+            TEST_EXIT_CODE=$?
+          else
+            # Try to find and run test executables
+            find . -type f -executable -name "*test*" -o -name "*Test*" | while read test_exe; do
+              echo "Running: $test_exe"
+              $test_exe || true
+            done
+            TEST_EXIT_CODE=$?
+          fi
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "TESTS_FAILED" > ../test_fail.txt
+          fi
+          
+          # Generate coverage report
+          cd ..
+          gcovr -r . \
+            --xml -o coverage.xml \
+            --html -o coverage.html \
+            --print-summary \
+            2>&1 | tee gcovr_output.txt || true
+          
+          # Try mutation testing if mull is available
+          if command -v mull-runner &> /dev/null; then
+            cd build
+            mull-runner . \
+              --reporters=Elements \
+              --output=../mutations.json \
+              2>&1 | tee ../mull_output.txt || true
+            cd ..
+          fi
 
-      # --- Java ---
+      # =======================
+      # Java Configuration
+      # =======================
       - name: Setup JDK
         if: ${{ github.event.inputs.language == 'java' }}
         uses: actions/setup-java@v4
@@ -100,15 +247,85 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Run Java tests
+      - name: Cache Maven dependencies
+        if: ${{ github.event.inputs.language == 'java' }}
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Run Java tests with coverage
         if: ${{ github.event.inputs.language == 'java' }}
         run: |
-          mvn clean test jacoco:report || echo "TESTS_FAILED" > test_fail.txt
-          mvn org.pitest:pitest-maven:mutationCoverage || echo "MUTATION_FAILED" > mutation_fail.txt
-          curl -L https://github.com/TestSmell/TestSmellDetector/releases/latest/download/TestSmellDetector.jar -o tsmelldetector.jar
-          java -jar tsmelldetector.jar -p src/test/java -o test_smells.txt || true
+          set +e
+          
+          # Check if Maven project
+          if [ -f "pom.xml" ]; then
+            # Clean and compile
+            mvn clean compile 2>&1 | tee maven_compile.txt
+            COMPILE_EXIT_CODE=$?
+            
+            if [ $COMPILE_EXIT_CODE -ne 0 ]; then
+              echo "BUILD_FAILED" > build_fail.txt
+              exit 0
+            fi
+            
+            # Run tests with JaCoCo coverage
+            mvn test jacoco:report 2>&1 | tee maven_test.txt
+            TEST_EXIT_CODE=$?
+            
+            if [ $TEST_EXIT_CODE -ne 0 ]; then
+              echo "TESTS_FAILED" > test_fail.txt
+            fi
+            
+            # Generate XML coverage report
+            mvn jacoco:report 2>&1 | tee jacoco_output.txt || true
+            
+            # Run PIT mutation testing
+            if [ $TEST_EXIT_CODE -eq 0 ]; then
+              # Add PIT plugin if not present
+              if ! grep -q "pitest-maven" pom.xml; then
+                echo "Adding PIT plugin to pom.xml"
+                mvn org.pitest:pitest-maven:help 2>/dev/null || true
+              fi
+              
+              mvn org.pitest:pitest-maven:mutationCoverage \
+                -DoutputFormats=XML,HTML \
+                2>&1 | tee pitest_output.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+            fi
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            # Gradle project
+            ./gradlew clean build test jacocoTestReport 2>&1 | tee gradle_output.txt
+            TEST_EXIT_CODE=$?
+            
+            if [ $TEST_EXIT_CODE -ne 0 ]; then
+              echo "TESTS_FAILED" > test_fail.txt
+            fi
+          fi
+          
+          # Download and run TestSmellDetector
+          if [ ! -f "TestSmellDetector.jar" ]; then
+            curl -L https://github.com/TestSmells/TestSmellDetector/releases/download/v1.0/TestSmellDetector.jar \
+              -o TestSmellDetector.jar 2>/dev/null || true
+          fi
+          
+          if [ -f "TestSmellDetector.jar" ]; then
+            # Find test directory
+            TEST_DIR=$(find . -type d -name "test" -o -name "tests" | grep -E "src/test/java|src/test" | head -1)
+            if [ -n "$TEST_DIR" ]; then
+              java -jar TestSmellDetector.jar -p "$TEST_DIR" -o test_smells.csv 2>&1 || true
+              # Convert CSV to text count
+              if [ -f "test_smells.csv" ]; then
+                tail -n +2 test_smells.csv | wc -l > test_smells.txt
+              fi
+            fi
+          fi
 
-      # --- Kotlin ---
+      # =======================
+      # Kotlin Configuration
+      # =======================
       - name: Setup JDK for Kotlin
         if: ${{ github.event.inputs.language == 'kotlin' }}
         uses: actions/setup-java@v4
@@ -116,160 +333,544 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Run Kotlin tests
+      - name: Cache Gradle dependencies
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Run Kotlin tests with coverage
         if: ${{ github.event.inputs.language == 'kotlin' }}
         run: |
-          ./gradlew test koverXmlReport || echo "TESTS_FAILED" > test_fail.txt
-          ./gradlew pitest || echo "MUTATION_FAILED" > mutation_fail.txt
-          ./gradlew detektTestSmells || echo "" > test_smells.txt || true
+          set +e
+          
+          # Make gradlew executable if it exists
+          if [ -f "gradlew" ]; then
+            chmod +x gradlew
+            GRADLE_CMD="./gradlew"
+          else
+            GRADLE_CMD="gradle"
+          fi
+          
+          # Clean and build
+          $GRADLE_CMD clean build 2>&1 | tee gradle_build.txt
+          BUILD_EXIT_CODE=$?
+          
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
+            echo "BUILD_FAILED" > build_fail.txt
+            exit 0
+          fi
+          
+          # Run tests
+          $GRADLE_CMD test 2>&1 | tee gradle_test.txt
+          TEST_EXIT_CODE=$?
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "TESTS_FAILED" > test_fail.txt
+          fi
+          
+          # Generate Kover coverage report
+          $GRADLE_CMD koverXmlReport 2>&1 | tee kover_output.txt || true
+          
+          # Run PIT mutation testing
+          if [ $TEST_EXIT_CODE -eq 0 ]; then
+            $GRADLE_CMD pitest 2>&1 | tee pitest_output.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+          fi
+          
+          # Run Detekt for test smells
+          $GRADLE_CMD detekt 2>&1 | tee detekt_output.txt || true
+          
+          # Count test smells from detekt report
+          if [ -f "build/reports/detekt/detekt.xml" ]; then
+            grep -c "<error" build/reports/detekt/detekt.xml > test_smells.txt 2>/dev/null || echo "0" > test_smells.txt
+          fi
 
-      # --- Go ---
+      # =======================
+      # Go Configuration
+      # =======================
       - name: Setup Go
         if: ${{ github.event.inputs.language == 'go' }}
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
 
-      - name: Run Go tests
+      - name: Cache Go modules
+        if: ${{ github.event.inputs.language == 'go' }}
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run Go tests with coverage
         if: ${{ github.event.inputs.language == 'go' }}
         run: |
-          go test ./... -coverprofile=coverage.out || echo "TESTS_FAILED" > test_fail.txt
-          go tool cover -func=coverage.out -o coverage.txt || true
-          go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest
-          $(go env GOPATH)/bin/go-mutesting ./... > mutest.json || true
-          grep -r "TODO\\|FIXME" *_test.go > test_smells.txt || true
+          set +e
+          
+          # Download dependencies
+          go mod download 2>/dev/null || true
+          
+          # Build the project
+          go build ./... 2>&1 | tee go_build.txt
+          BUILD_EXIT_CODE=$?
+          
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
+            echo "BUILD_FAILED" > build_fail.txt
+            exit 0
+          fi
+          
+          # Run tests with coverage
+          go test ./... -coverprofile=coverage.out -covermode=atomic -v 2>&1 | tee go_test.txt
+          TEST_EXIT_CODE=$?
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "TESTS_FAILED" > test_fail.txt
+          fi
+          
+          # Generate coverage reports
+          go tool cover -func=coverage.out > coverage.txt 2>&1 || true
+          go tool cover -html=coverage.out -o coverage.html 2>&1 || true
+          
+          # Convert to Cobertura XML format for parsing
+          go install github.com/t-yuki/gocover-cobertura@latest 2>/dev/null || true
+          if command -v gocover-cobertura &> /dev/null; then
+            gocover-cobertura < coverage.out > coverage.xml 2>&1 || true
+          fi
+          
+          # Install and run mutation testing
+          if [ $TEST_EXIT_CODE -eq 0 ]; then
+            go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest 2>/dev/null || true
+            
+            if command -v go-mutesting &> /dev/null; then
+              go-mutesting ./... --json > mutations.json 2>&1 || echo "MUTATION_FAILED" > mutation_fail.txt
+            fi
+          fi
+          
+          # Detect test smells
+          echo "Detecting test smells in Go tests..."
+          TEST_SMELLS=0
+          
+          # Count TODO/FIXME in test files
+          TODO_COUNT=$(grep -r "TODO\|FIXME" --include="*_test.go" . 2>/dev/null | wc -l || echo 0)
+          TEST_SMELLS=$((TEST_SMELLS + TODO_COUNT))
+          
+          # Count tests without assertions (basic check)
+          NO_ASSERT=$(grep -r "func Test" --include="*_test.go" . 2>/dev/null | \
+            while read line; do
+              file=$(echo $line | cut -d: -f1)
+              func=$(echo $line | cut -d: -f2-)
+              if ! grep -A 20 "$func" "$file" | grep -q "assert\|require\|t\.Error\|t\.Fatal\|t\.Fail" 2>/dev/null; then
+                echo "1"
+              fi
+            done | wc -l || echo 0)
+          TEST_SMELLS=$((TEST_SMELLS + NO_ASSERT))
+          
+          echo $TEST_SMELLS > test_smells.txt
 
-      # --- Debug File Structure ---
+      # =======================
+      # Debug and Artifacts
+      # =======================
       - name: Debug file structure
         run: |
-          find . -type f
+          echo "=== Current directory structure ==="
+          ls -la
+          echo ""
+          echo "=== Coverage files ==="
+          find . -name "coverage*" -type f 2>/dev/null | head -20
+          echo ""
+          echo "=== Test output files ==="
+          find . -name "*test*.txt" -o -name "*test*.xml" 2>/dev/null | head -20
+          echo ""
+          echo "=== Mutation files ==="
+          find . -name "*mutation*" -o -name "*mutant*" -o -name "*pit-reports*" 2>/dev/null | head -20
 
-      # --- Normalize Results ---
+      - name: Upload test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-outputs-${{ github.event.inputs.language }}
+          path: |
+            *output.txt
+            coverage.*
+            test_smells.txt
+            mutations.*
+            build_fail.txt
+            test_fail.txt
+            mutation_fail.txt
+          retention-days: 30
+
+      # =======================
+      # Parse and Summarize Metrics
+      # =======================
       - name: Parse and summarize metrics
+        if: always()
         run: |
-          python <<'EOF'
-          import json, glob, os, xml.etree.ElementTree as ET, sqlite3
+          python3 <<'EOF'
+          import json
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+          import sqlite3
+          import re
+          import sys
+
+          def safe_parse_xml(file_path):
+              """Safely parse XML file"""
+              try:
+                  return ET.parse(file_path)
+              except Exception as e:
+                  print(f"Failed to parse {file_path}: {e}")
+                  return None
+
+          def find_files(pattern, recursive=True):
+              """Find files matching pattern"""
+              files = glob.glob(pattern, recursive=recursive)
+              return files if files else []
 
           language = "${{ github.event.inputs.language }}"
+          print(f"Processing metrics for language: {language}")
 
+          # Initialize metrics
           coverage = None
-          mutation = None
+          mutation_score = None
           build_success = not os.path.exists("build_fail.txt")
           execution_success = not os.path.exists("test_fail.txt")
-
-          # --- Coverage ---
-          cobertura_files = glob.glob("**/coverage*.xml", recursive=True)
-          if cobertura_files and os.path.exists(cobertura_files[0]):
-              try:
-                  tree = ET.parse(cobertura_files[0])
-                  root = tree.getroot()
-                  if 'line-rate' in root.attrib:
-                      coverage = float(root.attrib['line-rate']) * 100
-              except Exception as e:
-                  print(f"Failed to parse coverage.xml: {e}")
-          else:
-              print("No coverage.xml file found")
-
-          jacoco_files = glob.glob("**/jacoco*.xml", recursive=True)
-          if jacoco_files:
-              tree = ET.parse(jacoco_files[0])
-              counters = tree.findall(".//counter[@type='LINE']")
-              if counters:
-                  covered = int(counters[0].attrib['covered'])
-                  missed = int(counters[0].attrib['missed'])
-                  coverage = covered * 100.0 / (covered + missed)
-
-          kover_files = glob.glob("**/kover.xml", recursive=True)
-          if kover_files:
-              tree = ET.parse(kover_files[0])
-              counters = tree.findall(".//counter[@type='LINE']")
-              if counters:
-                  covered = int(counters[0].attrib['covered'])
-                  missed = int(counters[0].attrib['missed'])
-                  coverage = covered * 100.0 / (covered + missed)
-
-          # --- Mutation ---
-          pitest_files = glob.glob("**/pit-reports/**/mutations.xml", recursive=True)
-          if pitest_files:
-              tree = ET.parse(pitest_files[0])
-              muts = tree.findall(".//mutation")
-              killed = sum(1 for m in muts if m.find("status").text == "KILLED")
-              total = len(muts)
-              if total > 0:
-                  mutation = killed * 100.0 / total
-
-          mull_json = glob.glob("**/mutations.json", recursive=True)
-          if mull_json:
-              with open(mull_json[0]) as f:
-                  data = json.load(f)
-                  muts = data.get("mutants", [])
-                  killed = sum(1 for m in muts if m.get("status") == "Killed")
-                  total = len(muts)
-                  if total > 0:
-                      mutation = killed * 100.0 / total
-
-          go_mutation = glob.glob("**/mutest.json", recursive=True)
-          if go_mutation:
-              with open(go_mutation[0]) as f:
-                  try:
-                      data = json.load(f)
-                      killed = sum(1 for m in data if m.get("status") == "killed")
-                      total = len(data)
-                      if total > 0:
-                          mutation = killed * 100.0 / total
-                  except:
-                      pass
-
-          # --- Python Mutation (mutmut) ---
-          mutmut_db = glob.glob("**/mutmut-cache", recursive=True)
-          if mutmut_db:
-              try:
-                  conn = sqlite3.connect(mutmut_db[0])
-                  cursor = conn.cursor()
-                  cursor.execute("SELECT status FROM mutant WHERE status IN ('killed', 'survived')")
-                  results = cursor.fetchall()
-                  total = len(results)
-                  killed = sum(1 for r in results if r[0] == 'killed')
-                  if total > 0:
-                      mutation = killed * 100.0 / total
-                  conn.close()
-              except Exception as e:
-                  print(f"Failed to parse mutmut database: {e}")
-          else:
-              print("No mutmut database found")
-
-          # --- Test Smells ---
           test_smells = None
-          if os.path.exists("test_smells.txt"):
-              with open("test_smells.txt") as f:
-                  test_smells = sum(1 for _ in f if _.strip())
 
-          # --- Debug Null Metrics ---
+          print("\n=== Checking for build/test failures ===")
+          print(f"Build success: {build_success}")
+          print(f"Execution success: {execution_success}")
+
+          # ===========================
+          # Coverage Parsing
+          # ===========================
+          print("\n=== Parsing coverage data ===")
+
+          # Try Cobertura format (Python, Go with gocover-cobertura)
+          coverage_files = find_files("**/coverage*.xml") + find_files("coverage*.xml", recursive=False)
+          for cov_file in coverage_files:
+              if coverage is not None:
+                  break
+              print(f"Checking coverage file: {cov_file}")
+              tree = safe_parse_xml(cov_file)
+              if tree:
+                  root = tree.getroot()
+                  # Check for Cobertura format
+                  if 'line-rate' in root.attrib:
+                      try:
+                          coverage = float(root.attrib['line-rate']) * 100
+                          print(f"Found Cobertura coverage: {coverage:.2f}%")
+                      except:
+                          pass
+
+          # Try JaCoCo format (Java)
           if coverage is None:
-              print("Coverage is None: No valid coverage data found")
-          if mutation is None:
-              print("Mutation score is None: No valid mutation data found")
+              jacoco_files = find_files("**/jacoco*.xml") + find_files("**/site/jacoco/jacoco.xml")
+              for jacoco_file in jacoco_files:
+                  if coverage is not None:
+                      break
+                  print(f"Checking JaCoCo file: {jacoco_file}")
+                  tree = safe_parse_xml(jacoco_file)
+                  if tree:
+                      # Find LINE counter
+                      counters = tree.findall(".//counter[@type='LINE']")
+                      for counter in counters:
+                          if 'covered' in counter.attrib and 'missed' in counter.attrib:
+                              covered = int(counter.attrib['covered'])
+                              missed = int(counter.attrib['missed'])
+                              total = covered + missed
+                              if total > 0:
+                                  coverage = (covered * 100.0) / total
+                                  print(f"Found JaCoCo coverage: {coverage:.2f}%")
+                                  break
 
+          # Try Kover format (Kotlin)
+          if coverage is None:
+              kover_files = find_files("**/kover*.xml") + find_files("**/reports/kover/report.xml")
+              for kover_file in kover_files:
+                  if coverage is not None:
+                      break
+                  print(f"Checking Kover file: {kover_file}")
+                  tree = safe_parse_xml(kover_file)
+                  if tree:
+                      # Similar to JaCoCo
+                      counters = tree.findall(".//counter[@type='LINE']")
+                      for counter in counters:
+                          if 'covered' in counter.attrib and 'missed' in counter.attrib:
+                              covered = int(counter.attrib['covered'])
+                              missed = int(counter.attrib['missed'])
+                              total = covered + missed
+                              if total > 0:
+                                  coverage = (covered * 100.0) / total
+                                  print(f"Found Kover coverage: {coverage:.2f}%")
+                                  break
+
+          # Try Go text coverage
+          if coverage is None and language == "go":
+              coverage_txt_files = find_files("coverage.txt", recursive=False)
+              for cov_txt in coverage_txt_files:
+                  print(f"Checking Go coverage text: {cov_txt}")
+                  with open(cov_txt, 'r') as f:
+                      content = f.read()
+                      # Look for total coverage line
+                      match = re.search(r'total:\s+\(statements\)\s+(\d+\.\d+)%', content)
+                      if not match:
+                          match = re.search(r'total:\s+.*\s+(\d+\.\d+)%', content)
+                      if match:
+                          coverage = float(match.group(1))
+                          print(f"Found Go text coverage: {coverage:.2f}%")
+                          break
+
+          # Try LCOV format (C++)
+          if coverage is None and language == "cpp":
+              lcov_files = find_files("**/lcov.info") + find_files("**/*.lcov")
+              for lcov_file in lcov_files:
+                  print(f"Checking LCOV file: {lcov_file}")
+                  with open(lcov_file, 'r') as f:
+                      lines_hit = 0
+                      lines_found = 0
+                      for line in f:
+                          if line.startswith('LH:'):
+                              lines_hit += int(line.split(':')[1])
+                          elif line.startswith('LF:'):
+                              lines_found += int(line.split(':')[1])
+                      if lines_found > 0:
+                          coverage = (lines_hit * 100.0) / lines_found
+                          print(f"Found LCOV coverage: {coverage:.2f}%")
+                          break
+
+          # ===========================
+          # Mutation Score Parsing
+          # ===========================
+          print("\n=== Parsing mutation data ===")
+
+          # PIT mutation testing (Java/Kotlin)
+          pitest_files = find_files("**/pit-reports/**/mutations.xml") + find_files("**/pitreports/**/mutations.xml")
+          for pit_file in pitest_files:
+              if mutation_score is not None:
+                  break
+              print(f"Checking PIT file: {pit_file}")
+              tree = safe_parse_xml(pit_file)
+              if tree:
+                  mutations = tree.findall(".//mutation")
+                  if mutations:
+                      statuses = [m.find("status").text for m in mutations if m.find("status") is not None]
+                      killed = sum(1 for s in statuses if s == "KILLED")
+                      total = len(statuses)
+                      if total > 0:
+                          mutation_score = (killed * 100.0) / total
+                          print(f"Found PIT mutation score: {mutation_score:.2f}%")
+
+          # Mull mutation testing (C++)
+          if mutation_score is None:
+              mull_files = find_files("**/mutations.json")
+              for mull_file in mull_files:
+                  print(f"Checking Mull file: {mull_file}")
+                  try:
+                      with open(mull_file, 'r') as f:
+                          data = json.load(f)
+                          if 'mutants' in data:
+                              mutants = data['mutants']
+                              killed = sum(1 for m in mutants if m.get('status') == 'Killed')
+                              total = len(mutants)
+                              if total > 0:
+                                  mutation_score = (killed * 100.0) / total
+                                  print(f"Found Mull mutation score: {mutation_score:.2f}%")
+                                  break
+                  except Exception as e:
+                      print(f"Failed to parse Mull JSON: {e}")
+
+          # Go mutation testing
+          if mutation_score is None and language == "go":
+              go_mutation_files = find_files("mutations.json", recursive=False)
+              for go_mut_file in go_mutation_files:
+                  print(f"Checking Go mutation file: {go_mut_file}")
+                  try:
+                      with open(go_mut_file, 'r') as f:
+                          content = f.read()
+                          if content.strip():
+                              # Parse go-mutesting output
+                              data = json.loads(content) if content.startswith('[') or content.startswith('{') else []
+                              if isinstance(data, list):
+                                  killed = sum(1 for m in data if m.get('status') == 'killed')
+                                  total = len(data)
+                                  if total > 0:
+                                      mutation_score = (killed * 100.0) / total
+                                      print(f"Found Go mutation score: {mutation_score:.2f}%")
+                                      break
+                  except Exception as e:
+                      print(f"Failed to parse Go mutation JSON: {e}")
+
+          # Python mutmut
+          if mutation_score is None and language == "python":
+              mutmut_dbs = find_files("**/.mutmut-cache") + find_files("**/mutmut-cache")
+              for mutmut_db in mutmut_dbs:
+                  print(f"Checking mutmut database: {mutmut_db}")
+                  try:
+                      conn = sqlite3.connect(mutmut_db)
+                      cursor = conn.cursor()
+                      
+                      # Check if table exists
+                      cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mutant'")
+                      if cursor.fetchone():
+                          cursor.execute("SELECT status, COUNT(*) FROM mutant GROUP BY status")
+                          results = cursor.fetchall()
+                          
+                          status_counts = {status: count for status, count in results}
+                          killed = status_counts.get('killed', 0)
+                          survived = status_counts.get('survived', 0)
+                          total = killed + survived
+                          
+                          if total > 0:
+                              mutation_score = (killed * 100.0) / total
+                              print(f"Found mutmut mutation score: {mutation_score:.2f}%")
+                              print(f"  Killed: {killed}, Survived: {survived}")
+                      
+                      conn.close()
+                      if mutation_score is not None:
+                          break
+                  except Exception as e:
+                      print(f"Failed to parse mutmut database: {e}")
+
+          # ===========================
+          # Test Smells Parsing
+          # ===========================
+          print("\n=== Parsing test smells ===")
+
+          if os.path.exists("test_smells.txt"):
+              with open("test_smells.txt", 'r') as f:
+                  content = f.read().strip()
+                  if content:
+                      # Try to parse as number
+                      try:
+                          test_smells = int(content.split('\n')[0])
+                          print(f"Found test smells count: {test_smells}")
+                      except:
+                          # Count non-empty lines
+                          lines = [l for l in content.split('\n') if l.strip()]
+                          test_smells = len(lines)
+                          print(f"Found test smells (line count): {test_smells}")
+
+          # Check for CSV test smell reports (Java)
+          if test_smells is None:
+              smell_csv_files = find_files("**/test_smells.csv")
+              for smell_csv in smell_csv_files:
+                  print(f"Checking test smell CSV: {smell_csv}")
+                  with open(smell_csv, 'r') as f:
+                      lines = f.readlines()
+                      # Skip header line
+                      test_smells = len(lines) - 1 if len(lines) > 1 else 0
+                      print(f"Found test smells from CSV: {test_smells}")
+                      break
+
+          # ===========================
+          # Final Summary
+          # ===========================
+          print("\n=== Final Metrics Summary ===")
+          
+          if coverage is None:
+              print("WARNING: No valid coverage data found")
+              print("Searched for: Cobertura XML, JaCoCo XML, Kover XML, LCOV, Go coverage.txt")
+          else:
+              print(f"Coverage: {coverage:.2f}%")
+          
+          if mutation_score is None:
+              print("WARNING: No valid mutation data found")
+              print("Searched for: PIT XML, Mull JSON, go-mutesting JSON, mutmut database")
+          else:
+              print(f"Mutation Score: {mutation_score:.2f}%")
+          
+          if test_smells is None:
+              print("WARNING: No test smell data found")
+              test_smells = 0
+          else:
+              print(f"Test Smells: {test_smells}")
+
+          # Create final result
           result = {
               "repo": "${{ github.event.inputs.repo }}",
               "pr_number": "${{ github.event.inputs.pr_number }}",
               "language": language,
-              "coverage": coverage,
-              "mutation_score": mutation,
+              "coverage": round(coverage, 2) if coverage is not None else None,
+              "mutation_score": round(mutation_score, 2) if mutation_score is not None else None,
               "compilation_success": build_success,
               "execution_success": execution_success,
-              "test_smells": test_smells
+              "test_smells": test_smells,
+              "timestamp": os.environ.get('GITHUB_RUN_ID', 'unknown'),
+              "workflow_run": os.environ.get('GITHUB_RUN_NUMBER', 'unknown')
           }
 
+          # Write results to file
           with open("metrics.json", "w") as f:
               json.dump(result, f, indent=2)
 
-          print("== Final Metrics ==")
+          print("\n=== Metrics JSON Output ===")
           print(json.dumps(result, indent=2))
+
+          # Create a markdown summary
+          summary = f"""# Test Metrics Report
+
+          ## Repository Information
+          - **Repository**: {result['repo']}
+          - **Pull Request**: #{result['pr_number']}
+          - **Language**: {result['language']}
+
+          ## Build Status
+          - **Compilation**: {'✅ Success' if result['compilation_success'] else '❌ Failed'}
+          - **Test Execution**: {'✅ Success' if result['execution_success'] else '❌ Failed'}
+
+          ## Code Quality Metrics
+          - **Code Coverage**: {f"{result['coverage']}%" if result['coverage'] is not None else 'N/A'}
+          - **Mutation Score**: {f"{result['mutation_score']}%" if result['mutation_score'] is not None else 'N/A'}
+          - **Test Smells**: {result['test_smells'] if result['test_smells'] is not None else 'N/A'}
+
+          ## Metric Thresholds
+          - 🟢 **Good**: Coverage > 80%, Mutation > 60%
+          - 🟡 **Acceptable**: Coverage > 60%, Mutation > 40%
+          - 🔴 **Needs Improvement**: Coverage < 60%, Mutation < 40%
+          """
+
+          with open("metrics_summary.md", "w") as f:
+              f.write(summary)
+
+          print("\n=== Markdown Summary Created ===")
+
+          # Exit with appropriate code
+          if not build_success:
+              print("\nExiting with code 1: Build failed")
+              sys.exit(1)
+          elif not execution_success:
+              print("\nExiting with code 2: Tests failed")
+              sys.exit(2)
+          else:
+              print("\nExiting with code 0: Success")
+              sys.exit(0)
           EOF
 
-      - name: Upload metrics.json
+      - name: Upload metrics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: metrics
-          path: metrics.json
+          name: metrics-${{ github.event.inputs.language }}-${{ github.event.inputs.pr_number }}
+          path: |
+            metrics.json
+            metrics_summary.md
+          retention-days: 30
+
+
+      - name: Generate job summary
+        if: always()
+        run: |
+          if [ -f "metrics_summary.md" ]; then
+            cat metrics_summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No metrics summary available" >> $GITHUB_STEP_SUMMARY
+          fi
