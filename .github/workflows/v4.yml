@@ -1,0 +1,177 @@
+name: Human Test Metrics v4
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository (e.g. owner/name)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+      language:
+        description: "Project language (python, cpp, go, java, kotlin)"
+        required: true
+        type: choice
+        options:
+          - python
+          - cpp
+          - go
+          - java
+          - kotlin
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout external PR
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
+
+      # -------- Setup Environments --------
+      - name: Setup Python
+        if: ${{ github.event.inputs.language == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup C++
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake lcov
+
+      - name: Setup Go
+        if: ${{ github.event.inputs.language == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Setup Java
+        if: ${{ github.event.inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Kotlin
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y default-jdk curl unzip
+          curl -s https://get.sdkman.io | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install kotlin
+
+      # -------- Install Dependencies --------
+      - name: Install Python deps
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          pip install -r requirements.txt || true
+          pip install pytest pytest-cov mutmut
+
+      - name: Install Go deps
+        if: ${{ github.event.inputs.language == 'go' }}
+        run: go mod tidy
+
+      - name: Install Java deps
+        if: ${{ github.event.inputs.language == 'java' && hashFiles('pom.xml') != '' }}
+        run: mvn dependency:resolve
+
+      - name: Install Gradle deps
+        if: ${{ github.event.inputs.language == 'java' && hashFiles('build.gradle*') != '' }}
+        run: ./gradlew build --no-daemon -x test
+
+      - name: Install Kotlin deps
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        run: ./gradlew build --no-daemon -x test || true
+
+      # -------- Run Tests + Coverage --------
+      - name: Run Python tests with coverage
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: pytest --cov=. --cov-report=xml --cov-report=term
+
+      - name: Run C++ tests with coverage
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="--coverage" ..
+          make
+          ctest --output-on-failure
+          lcov --capture --directory . --output-file coverage.info
+          lcov --remove coverage.info '/usr/*' --output-file coverage.info
+          genhtml coverage.info --output-directory coverage-report
+
+      - name: Run Go tests with coverage
+        if: ${{ github.event.inputs.language == 'go' }}
+        run: go test ./... -coverprofile=coverage.out
+
+      - name: Run Java tests with coverage (Maven)
+        if: ${{ github.event.inputs.language == 'java' && hashFiles('pom.xml') != '' }}
+        run: mvn test jacoco:report
+
+      - name: Run Java tests with coverage (Gradle)
+        if: ${{ github.event.inputs.language == 'java' && hashFiles('build.gradle*') != '' }}
+        run: ./gradlew test jacocoTestReport
+
+      - name: Run Kotlin tests with coverage
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        run: ./gradlew test jacocoTestReport || mvn test jacoco:report
+
+      # -------- Run Mutation Testing --------
+      - name: Python mutation tests
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: mutmut run --paths-to-mutate .
+
+      - name: C++ mutation tests (placeholder)
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: echo "Use Mull (https://github.com/mull-project/mull) for mutation testing. Needs custom setup."
+
+      - name: Go mutation tests
+        if: ${{ github.event.inputs.language == 'go' }}
+        run: |
+          go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest
+          ~/go/bin/go-mutesting ./...
+
+      - name: Java/Kotlin mutation tests
+        if: ${{ github.event.inputs.language == 'java' || github.event.inputs.language == 'kotlin' }}
+        run: ./gradlew pitest || mvn org.pitest:pitest-maven:mutationCoverage || true
+
+      # -------- Collect Artifacts --------
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            coverage.out
+            coverage.xml
+            coverage.info
+            coverage-report/**
+            target/site/jacoco/**
+            build/reports/jacoco/**
+          if-no-files-found: ignore
+
+      - name: Upload mutation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-reports
+          path: |
+            .mutmut-cache/**
+            build/reports/pitest/**
+            target/pit-reports/**
+          if-no-files-found: ignore
+
+      # -------- Run Agent --------
+      - name: Run Agent.py on results
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          python agent.py --coverage coverage.xml --mutation .mutmut-cache || true
+
+      - name: Upload agent output
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-output
+          path: agent_output/*
+          if-no-files-found: ignore
