@@ -50,9 +50,17 @@ jobs:
         if: ${{ github.event.inputs.language == 'python' }}
         run: |
           set -o pipefail
-          pytest --cov=. --cov-report=xml:coverage.xml --cov-context=test || echo "TESTS_FAILED" > test_fail.txt
-          mutmut run  || echo "MUTATION_FAILED" > mutation_fail.txt
+          pytest --cov=. --cov-report=xml:coverage.xml --cov-context=test > pytest_output.txt 2>&1 || echo "TESTS_FAILED" > test_fail.txt
+          mutmut run --runner "pytest" || echo "MUTATION_FAILED" > mutation_fail.txt
+          mutmut results --xml > mutations.xml || true
           flake8 --select=PT --exit-zero tests/ > test_smells.txt || true
+
+      - name: Upload test output
+        if: ${{ github.event.inputs.language == 'python' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: pytest_output.txt
 
       # --- C++ ---
       - name: Install C++ tools
@@ -120,11 +128,16 @@ jobs:
           $(go env GOPATH)/bin/go-mutesting ./... > mutest.json || true
           grep -r "TODO\\|FIXME" *_test.go > test_smells.txt || true
 
+      # --- Debug File Structure ---
+      - name: Debug file structure
+        run: |
+          find . -type f
+
       # --- Normalize Results ---
       - name: Parse and summarize metrics
         run: |
           python <<'EOF'
-          import json, glob, os, xml.etree.ElementTree as ET
+          import json, glob, os, xml.etree.ElementTree as ET, sqlite3
 
           language = "${{ github.event.inputs.language }}"
 
@@ -135,14 +148,16 @@ jobs:
 
           # --- Coverage ---
           cobertura_files = glob.glob("**/coverage*.xml", recursive=True)
-          if cobertura_files:
+          if cobertura_files and os.path.exists(cobertura_files[0]):
               try:
                   tree = ET.parse(cobertura_files[0])
                   root = tree.getroot()
                   if 'line-rate' in root.attrib:
                       coverage = float(root.attrib['line-rate']) * 100
-              except Exception:
-                  pass
+              except Exception as e:
+                  print(f"Failed to parse coverage.xml: {e}")
+          else:
+              print("No coverage.xml file found")
 
           jacoco_files = glob.glob("**/jacoco*.xml", recursive=True)
           if jacoco_files:
@@ -194,11 +209,48 @@ jobs:
                   except:
                       pass
 
+          # --- Python Mutation (mutmut) ---
+          mutmut_files = glob.glob("**/mutations.xml", recursive=True)
+          if mutmut_files:
+              try:
+                  tree = ET.parse(mutmut_files[0])
+                  root = tree.getroot()
+                  muts = root.findall(".//mutation")
+                  killed = sum(1 for m in muts if m.find("status").text.lower() == "killed")
+                  total = len(muts)
+                  if total > 0:
+                      mutation = killed * 100.0 / total
+              except Exception as e:
+                  print(f"Failed to parse mutmut mutations.xml: {e}")
+          else:
+              mutmut_db = glob.glob("**/mutmut-cache", recursive=True)
+              if mutmut_db:
+                  try:
+                      conn = sqlite3.connect(mutmut_db[0])
+                      cursor = conn.cursor()
+                      cursor.execute("SELECT status FROM mutant WHERE status IN ('killed', 'survived')")
+                      results = cursor.fetchall()
+                      total = len(results)
+                      killed = sum(1 for r in results if r[0] == 'killed')
+                      if total > 0:
+                          mutation = killed * 100.0 / total
+                      conn.close()
+                  except Exception as e:
+                      print(f"Failed to parse mutmut database: {e}")
+              else:
+                  print("No mutation files or database found for mutmut")
+
           # --- Test Smells ---
           test_smells = None
           if os.path.exists("test_smells.txt"):
               with open("test_smells.txt") as f:
                   test_smells = sum(1 for _ in f if _.strip())
+
+          # --- Debug Null Metrics ---
+          if coverage is None:
+              print("Coverage is None: No valid coverage data found")
+          if mutation is None:
+              print("Mutation score is None: No valid mutation data found")
 
           result = {
               "repo": "${{ github.event.inputs.repo }}",
@@ -223,3 +275,4 @@ jobs:
         with:
           name: metrics
           path: metrics.json
+```
