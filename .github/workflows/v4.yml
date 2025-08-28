@@ -163,12 +163,6 @@ jobs:
             target/pit-reports/**
           if-no-files-found: ignore
 
-      # -------- Run Agent --------
-      - name: Run Agent.py on results
-        if: ${{ github.event.inputs.language == 'python' }}
-        run: |
-          python agent.py --coverage coverage.xml --mutation .mutmut-cache || true
-
       - name: Upload agent output
         uses: actions/upload-artifact@v4
         with:
