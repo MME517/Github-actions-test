@@ -268,7 +268,9 @@ jobs:
             SOURCE_PATHS="."
           fi
           
-          echo "Source paths to mutate: $SOURCE_PATHS"
+          # Convert to comma-separated for mutmut config
+          PATHS_CSV=$(echo $SOURCE_PATHS | tr ' ' ',')
+          echo "Source paths to mutate: $PATHS_CSV"
           
           # Create mutmut config
           cat > .mutmut.cfg <<EOF
@@ -285,8 +287,7 @@ jobs:
           rm -f .mutmut-cache 2>/dev/null || true
           
           # Run mutmut with timeout per mutant
-          for path in $SOURCE_PATHS; do
-           timeout 1800 mutmut run --paths-to-mutate="$SOURCE_PATHS" --use-coverage --simple-output \2>&1 | tee -a mutmut_output.txt || true
+          timeout 1800 mutmut run --use-coverage --simple-output 2>&1 | tee mutmut_output.txt || true
           done
           
           # Check if mutation testing succeeded
