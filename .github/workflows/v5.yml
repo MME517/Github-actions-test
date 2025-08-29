@@ -799,21 +799,7 @@ jobs:
           ooze run ./... > go_mutation.txt || echo "MUTATION_FAILED" > mutation_fail.txt
           go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
           golangci-lint run ./... --out-format checkstyle > golangci-lint.xml || true
-
-      ############################################################
-      # UPLOAD REPORTS
-      ############################################################
-      - name: Collect reports
-        run: |
-          mkdir -p reports
-          cp -r *.xml *.txt *.html *.out *.info *.json coverage* mutation* *output.txt reports/ 2>/dev/null || true
-
-      - name: Upload consolidated reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-${{ github.event.inputs.pr_number }}-metrics
-          path: reports
-
+          
       # =======================
       # Debug and Artifacts
       # =======================
