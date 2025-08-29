@@ -286,8 +286,7 @@ jobs:
           
           # Run mutmut with timeout per mutant
           for path in $SOURCE_PATHS; do
-            echo "Mutating path: $path"
-            timeout 1800 mutmut run --runner="python -m pytest -x -q" --use-coverage 2>&1 | tee -a mutmut_output.txt || true
+           timeout 1800 mutmut run --paths-to-mutate="$SOURCE_PATHS" --use-coverage --simple-output \2>&1 | tee -a mutmut_output.txt || true
           done
           
           # Check if mutation testing succeeded
