@@ -253,6 +253,7 @@ jobs:
           "
           fi
 
+     
       - name: Run Python mutation testing with mutmut
         if: ${{ github.event.inputs.language == 'python' }}
         run: |
@@ -268,9 +269,7 @@ jobs:
             SOURCE_PATHS="."
           fi
           
-          # Convert to comma-separated for mutmut config
-          PATHS_CSV=$(echo $SOURCE_PATHS | tr ' ' ',')
-          echo "Source paths to mutate: $PATHS_CSV"
+          echo "Source paths to mutate: $SOURCE_PATHS"
           
           # Create mutmut config
           cat > .mutmut.cfg <<EOF
@@ -287,7 +286,14 @@ jobs:
           rm -f .mutmut-cache 2>/dev/null || true
           
           # Run mutmut with timeout per mutant
-          timeout 1800 mutmut run --use-coverage --simple-output 2>&1 | tee mutmut_output.txt || true
+          for path in $SOURCE_PATHS; do
+            echo "Mutating path: $path"
+            timeout 1800 mutmut run \
+              --paths-to-mutate="$path" \
+              --runner="python -m pytest -x -q" \
+              --use-coverage \
+              --simple-output \
+              2>&1 | tee -a mutmut_output.txt || true
           done
           
           # Check if mutation testing succeeded
@@ -320,6 +326,7 @@ jobs:
           else
             echo "MUTATION_FAILED" > mutation_fail.txt
           fi
+
 
       - name: Detect Python test smells
         if: ${{ github.event.inputs.language == 'python' }}
