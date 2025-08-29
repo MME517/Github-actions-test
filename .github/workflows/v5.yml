@@ -1,4 +1,4 @@
-name: Human Test Metrics v3
+name: Human Test Metrics v5
 
 on:
   workflow_dispatch:
