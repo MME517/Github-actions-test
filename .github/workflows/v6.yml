@@ -1,0 +1,1278 @@
+
+name: Human Test Metrics v6
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository (e.g. owner/name)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+      language:
+        description: "Project language"
+        required: true
+        type: choice
+        options:
+          - python
+          - cpp
+          - java
+          - kotlin
+          - go
+
+jobs:
+  test-metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
+          fetch-depth: 0
+
+      - name: Setup Python for parsing (always needed)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install parsing dependencies
+        run: |
+          pip install lxml beautifulsoup4 pandas xmlstarlet
+
+      # =======================
+      # Python Configuration
+      # =======================
+      - name: Setup Python Project
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          # Install Python project dependencies
+          pip install --upgrade pip wheel setuptools
+          
+          # Try multiple ways to install project dependencies
+          echo "=== Installing project dependencies ==="
+          
+          # Check for various dependency files
+          if [ -f "requirements.txt" ]; then
+            echo "Found requirements.txt"
+            pip install -r requirements.txt
+          fi
+          
+          if [ -f "requirements-dev.txt" ]; then
+            echo "Found requirements-dev.txt"
+            pip install -r requirements-dev.txt
+          fi
+          
+          if [ -f "requirements/dev.txt" ]; then
+            echo "Found requirements/dev.txt"
+            pip install -r requirements/dev.txt
+          fi
+          
+          if [ -f "requirements/test.txt" ]; then
+            echo "Found requirements/test.txt"
+            pip install -r requirements/test.txt
+          fi
+          
+          if [ -f "setup.py" ]; then
+            echo "Found setup.py"
+            pip install -e ".[test]" 2>/dev/null || pip install -e ".[tests]" 2>/dev/null || pip install -e . 2>/dev/null || true
+          fi
+          
+          if [ -f "pyproject.toml" ]; then
+            echo "Found pyproject.toml"
+            # Check if it's a poetry project
+            if grep -q "tool.poetry" pyproject.toml; then
+              pip install poetry
+              poetry install --with test 2>/dev/null || poetry install 2>/dev/null || true
+            else
+              pip install -e ".[test]" 2>/dev/null || pip install -e ".[tests]" 2>/dev/null || pip install -e . 2>/dev/null || true
+            fi
+          fi
+          
+          if [ -f "Pipfile" ]; then
+            echo "Found Pipfile"
+            pip install pipenv
+            pipenv install --dev --deploy --system 2>/dev/null || pipenv install --system 2>/dev/null || true
+          fi
+          
+          # Install comprehensive testing tools
+          pip install pytest pytest-cov pytest-xdist pytest-timeout pytest-mock coverage[toml] mutmut
+          pip install flake8 flake8-pytest-style flake8-test-name flake8-aaa flake8-assertive
+          pip install pylint radon mccabe
+          pip install hypothesis pytest-benchmark pytest-sugar
+
+      - name: Configure Python testing environment
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          # Create comprehensive coverage configuration
+          cat > .coveragerc <<'EOF'
+          [run]
+          branch = True
+          source = .
+          omit = 
+              */tests/*
+              */test/*
+              */__pycache__/*
+              */venv/*
+              */env/*
+              */.venv/*
+              */setup.py
+              */conf.py
+              */docs/*
+              */migrations/*
+          parallel = True
+          
+          [report]
+          precision = 2
+          show_missing = True
+          skip_covered = False
+          
+          [xml]
+          output = coverage.xml
+          EOF
+          
+          # Create pytest configuration if not exists
+          if [ ! -f "pytest.ini" ] && [ ! -f "setup.cfg" ] && [ ! -f "pyproject.toml" ]; then
+            cat > pytest.ini <<'EOF'
+          [pytest]
+          testpaths = tests test testing
+          python_files = test_*.py *_test.py *tests.py
+          python_classes = Test* *Tests *Test
+          python_functions = test_*
+          addopts = 
+              -ra
+              --strict-markers
+              --cov=.
+              --cov-branch
+              --cov-report=term-missing:skip-covered
+              --cov-report=xml
+              --cov-report=html
+              --tb=short
+              -v
+          EOF
+          elif [ -f "pyproject.toml" ] && ! grep -q "\[tool.pytest.ini_options\]" pyproject.toml; then
+            echo "[tool.pytest.ini_options]" >> pyproject.toml
+            echo "testpaths = ['tests', 'test', 'testing']" >> pyproject.toml
+            echo "python_files = ['test_*.py', '*_test.py', '*tests.py']" >> pyproject.toml
+            echo "python_classes = ['Test*', '*Tests', '*Test']" >> pyproject.toml
+            echo "python_functions = ['test_*']" >> pyproject.toml
+            echo "addopts = '-ra --strict-markers --cov=. --cov-branch --cov-report=term-missing:skip-covered --cov-report=xml --cov-report=html --tb=short -v'" >> pyproject.toml
+          fi
+
+      - name: Discover Python project structure
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          echo "=== Python Project Structure ==="
+          
+          # Find main source directories
+          echo "Source directories:"
+          find . -type f -name "*.py" -not -path "*/test*" -not -path "*/.*" | head -20
+          
+          # Find test directories
+          echo -e "\nTest directories:"
+          find . -type d \( -name "test*" -o -name "*test" -o -name "*tests" \) -not -path "*/.*" | head -10
+          
+          # Find test files
+          echo -e "\nTest files:"
+          find . -type f -name "*test*.py" -not -path "*/.*" | head -20
+          
+          # Identify main package
+          echo -e "\nMain packages:"
+          find . -maxdepth 2 -type f -name "__init__.py" -not -path "*/test*" -not -path "*/.*" | xargs -r dirname | sort -u
+          
+          # Store information for later use
+          MAIN_PACKAGE=$(find . -maxdepth 2 -type f -name "__init__.py" -not -path "*/test*" -not -path "*/.*" | head -1 | xargs -r dirname)
+          echo "MAIN_PACKAGE=${MAIN_PACKAGE}" >> $GITHUB_ENV
+
+      - name: Run Python tests with comprehensive coverage
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          set +e
+          
+          # Find test directories and files
+          TEST_PATHS=""
+          for dir in tests test testing test_suite; do
+            if [ -d "$dir" ]; then
+              TEST_PATHS="$TEST_PATHS $dir"
+            fi
+          done
+          
+          # If no test directories, find test files
+          if [ -z "$TEST_PATHS" ]; then
+            TEST_FILES=$(find . -name "*test*.py" -o -name "test_*.py" | grep -v __pycache__ | grep -v ".venv")
+            if [ -n "$TEST_FILES" ]; then
+              TEST_PATHS="."
+            fi
+          fi
+          
+          echo "Test paths: $TEST_PATHS"
+          
+          # Run tests with coverage
+          if [ -n "$TEST_PATHS" ]; then
+            # Clear any previous coverage data
+            coverage erase 2>/dev/null || true
+            
+            # Run pytest with coverage
+            python -m pytest $TEST_PATHS \
+              --cov=. \
+              --cov-branch \
+              --cov-report=xml:coverage.xml \
+              --cov-report=html:htmlcov \
+              --cov-report=term-missing \
+              --cov-report=json:coverage.json \
+              --junit-xml=pytest-report.xml \
+              --timeout=300 \
+              -v \
+              --tb=short 2>&1 | tee pytest_output.txt
+            
+            TEST_EXIT_CODE=${PIPESTATUS[0]}
+            
+            # Also try coverage run as backup
+            if [ ! -f "coverage.xml" ] || [ $TEST_EXIT_CODE -ne 0 ]; then
+              coverage run -m pytest $TEST_PATHS 2>&1 | tee coverage_run_output.txt
+              coverage xml -o coverage.xml
+              coverage json -o coverage.json
+              coverage html -d htmlcov
+              coverage report | tee coverage_report.txt
+            fi
+          else
+            echo "No tests found" | tee pytest_output.txt
+            TEST_EXIT_CODE=1
+          fi
+          
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "TESTS_FAILED" > test_fail.txt
+          fi
+          
+          # Display coverage report
+          if [ -f "coverage.xml" ]; then
+            echo -e "\n=== Coverage Summary ==="
+            python -c "
+import xml.etree.ElementTree as ET
+tree = ET.parse('coverage.xml')
+root = tree.getroot()
+print(f'Line Coverage: {float(root.attrib.get(\"line-rate\", 0)) * 100:.2f}%')
+print(f'Branch Coverage: {float(root.attrib.get(\"branch-rate\", 0)) * 100:.2f}%')
+"
+          fi
+
+      - name: Run Python mutation testing with mutmut
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          set +e
+          
+          # Configure mutmut
+          echo "=== Configuring mutmut ==="
+          
+          # Find source paths to mutate (exclude tests)
+          SOURCE_PATHS=$(find . -name "*.py" -not -path "*/test*" -not -path "*/.*" -not -path "*/venv/*" -not -path "*/env/*" | head -50 | xargs -r dirname | sort -u | head -5 | tr '\n' ',')
+          
+          if [ -z "$SOURCE_PATHS" ]; then
+            SOURCE_PATHS="."
+          fi
+          
+          echo "Source paths to mutate: $SOURCE_PATHS"
+          
+          # Create mutmut config
+          cat > .mutmut-config.yml <<EOF
+mutmut:
+  paths_to_mutate: $SOURCE_PATHS
+  tests_dirs: tests test testing
+  runner: python -m pytest -x -q
+  use_coverage: true
+EOF
+          
+          # Run mutation testing
+          echo "=== Running mutation testing ==="
+          
+          # Initialize mutmut cache
+          rm -f .mutmut-cache 2>/dev/null || true
+          
+          # Run mutmut
+          timeout 1800 mutmut run \
+            --config .mutmut-config.yml \
+            2>&1 | tee mutmut_output.txt || true
+          
+          # Check if mutation testing succeeded
+          if [ -f ".mutmut-cache" ]; then
+            echo -e "\n=== Mutation Testing Results ==="
+            mutmut results 2>&1 | tee mutations.txt || true
+            mutmut show all 2>&1 | tee mutations_detailed.txt || true
+            mutmut html 2>/dev/null || true
+            
+            # Extract mutation score
+            python -c "
+import sqlite3
+try:
+    conn = sqlite3.connect('.mutmut-cache')
+    cursor = conn.cursor()
+    cursor.execute('SELECT status, COUNT(*) FROM mutant GROUP BY status')
+    results = dict(cursor.fetchall())
+    killed = results.get('killed', 0)
+    survived = results.get('survived', 0)
+    timeout = results.get('timeout', 0)
+    total = killed + survived + timeout
+    if total > 0:
+        score = (killed / total) * 100
+        print(f'Mutation Score: {score:.2f}%')
+        print(f'Killed: {killed}, Survived: {survived}, Timeout: {timeout}')
+    conn.close()
+except Exception as e:
+    print(f'Error reading mutation results: {e}')
+" | tee mutation_score.txt
+          else
+            echo "MUTATION_FAILED" > mutation_fail.txt
+          fi
+
+      - name: Detect Python test smells
+        if: ${{ github.event.inputs.language == 'python' }}
+        run: |
+          echo "=== Detecting Test Smells ==="
+          
+          # Initialize smell counter
+          TOTAL_SMELLS=0
+          
+          # Find test files
+          TEST_FILES=$(find . -name "*test*.py" -o -name "test_*.py" | grep -v __pycache__ | grep -v ".venv")
+          
+          # 1. Flake8 test smells
+          echo "Running flake8 for test smells..."
+          if [ -n "$TEST_FILES" ]; then
+            flake8 --select=PT,AAA,T $TEST_FILES --exit-zero > flake8_smells.txt 2>&1 || true
+            FLAKE8_COUNT=$(wc -l < flake8_smells.txt)
+          else
+            FLAKE8_COUNT=0
+            echo "No test files found for flake8" > flake8_smells.txt
+          fi
+          TOTAL_SMELLS=$((TOTAL_SMELLS + FLAKE8_COUNT))
+          
+          # 2. Custom smell detection
+          python3 <<'PYTHON_SMELL_DETECTOR'
+import os
+import ast
+import re
+from pathlib import Path
+
+test_files = []
+for pattern in ["*test*.py", "test_*.py"]:
+    test_files.extend(Path(".").rglob(pattern))
+
+smells = []
+
+for file_path in test_files:
+    if ".venv" in str(file_path) or "__pycache__" in str(file_path):
+        continue
+        
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            tree = ast.parse(content)
+        
+        # Detect various test smells
+        for node in ast.walk(tree):
+            # 1. Empty tests
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test"):
+                if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
+                    smells.append(f"{file_path}:{node.lineno}: Empty test")
+                
+                # 2. Tests without assertions
+                has_assert = any(isinstance(n, ast.Assert) for n in ast.walk(node))
+                has_assert_call = any(
+                    isinstance(n, ast.Call) and 
+                    isinstance(n.func, ast.Attribute) and 
+                    n.func.attr.startswith('assert')
+                    for n in ast.walk(node)
+                )
+                if not has_assert and not has_assert_call and len(node.body) > 1:
+                    smells.append(f"{file_path}:{node.lineno}: Test without assertion")
+                
+                # 3. Too many assertions (>5)
+                assertion_count = sum(1 for n in ast.walk(node) if isinstance(n, ast.Assert))
+                if assertion_count > 5:
+                    smells.append(f"{file_path}:{node.lineno}: Too many assertions ({assertion_count})")
+        
+        # 4. TODO/FIXME in tests
+        for i, line in enumerate(content.split('\n'), 1):
+            if 'TODO' in line or 'FIXME' in line:
+                smells.append(f"{file_path}:{i}: TODO/FIXME comment")
+        
+        # 5. Hardcoded test data
+        hardcoded_patterns = [
+            r'127\.0\.0\.1',
+            r'localhost:?\d+',
+            r'password\s*=\s*["\'].*["\']',
+            r'/tmp/test',
+            r'C:\\\\test'
+        ]
+        for pattern in hardcoded_patterns:
+            matches = re.finditer(pattern, content, re.IGNORECASE)
+            for match in matches:
+                line_no = content[:match.start()].count('\n') + 1
+                smells.append(f"{file_path}:{line_no}: Hardcoded test data")
+        
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+
+# Write smells to file
+with open("custom_smells.txt", "w") as f:
+    for smell in smells:
+        f.write(smell + "\n")
+
+print(f"Found {len(smells)} custom test smells")
+PYTHON_SMELL_DETECTOR
+          
+          CUSTOM_COUNT=$(wc -l < custom_smells.txt 2>/dev/null || echo 0)
+          TOTAL_SMELLS=$((TOTAL_SMELLS + CUSTOM_COUNT))
+          
+          # 3. Cyclomatic complexity in tests
+          echo "Checking cyclomatic complexity in tests..."
+          if [ -n "$TEST_FILES" ]; then
+            radon cc $TEST_FILES -s -n B 2>/dev/null | grep -E "^\s+[FCD]" > complex_tests.txt || true
+            COMPLEX_COUNT=$(wc -l < complex_tests.txt 2>/dev/null || echo 0)
+          else
+            COMPLEX_COUNT=0
+            echo "No test files found for radon" > complex_tests.txt
+          fi
+          TOTAL_SMELLS=$((TOTAL_SMELLS + COMPLEX_COUNT))
+          
+          # Save total count
+          echo $TOTAL_SMELLS > test_smells.txt
+          echo "Total test smells found: $TOTAL_SMELLS"
+
+      # =======================
+      # C++ Configuration
+      # =======================
+      - name: Install C++ tools
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            lcov \
+            gcovr \
+            clang \
+            clang-tidy \
+            cppcheck \
+            llvm \
+            libgtest-dev \
+            libgmock-dev \
+            catch2 \
+            meson
+
+          # Build Google Test
+          if [ -d "/usr/src/gtest" ]; then
+            cd /usr/src/gtest
+            sudo cmake CMakeLists.txt
+            sudo make
+            sudo cp lib/*.a /usr/lib || sudo cp *.a /usr/lib
+            cd -
+          fi
+
+      - name: Build and test C++ with comprehensive coverage
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          set +e
+          
+          # Find build system
+          BUILD_SYSTEM=""
+          if [ -f "CMakeLists.txt" ]; then
+            BUILD_SYSTEM="cmake"
+          elif [ -f "Makefile" ]; then
+            BUILD_SYSTEM="make"
+          elif [ -f "meson.build" ]; then
+            BUILD_SYSTEM="meson"
+          fi
+          
+          echo "BUILD_SYSTEM=$BUILD_SYSTEM" >> $GITHUB_ENV
+          
+          if [ -z "$BUILD_SYSTEM" ]; then
+            echo "No supported build system found" | tee build_output.txt
+            echo "BUILD_FAILED" > build_fail.txt
+            exit 0
+          fi
+          
+          echo "Build system: $BUILD_SYSTEM"
+          
+          if [ "$BUILD_SYSTEM" = "cmake" ]; then
+            # CMake build
+            mkdir -p build && cd build
+            
+            cmake .. \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_CXX_FLAGS="--coverage -g -O0 -fprofile-arcs -ftest-coverage -fPIC" \
+              -DCMAKE_C_FLAGS="--coverage -g -O0 -fprofile-arcs -ftest-coverage -fPIC" \
+              -DCMAKE_EXE_LINKER_FLAGS="--coverage -lgcov" \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+              2>&1 | tee ../cmake_output.txt
+            
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > ../build_fail.txt
+              cd ..
+              exit 0
+            fi
+            
+            # Build
+            make -j$(nproc) VERBOSE=1 2>&1 | tee ../make_output.txt
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > ../build_fail.txt
+              cd ..
+              exit 0
+            fi
+            
+            # Run tests
+            ctest --output-on-failure -V 2>&1 | tee ../ctest_output.txt
+            TEST_EXIT=$?
+            
+            # Generate coverage
+            cd ..
+            lcov --capture --directory . --output-file coverage.info 2>/dev/null || true
+            lcov --remove coverage.info '/usr/*' '*/test/*' '*/tests/*' --output-file coverage.info 2>/dev/null || true
+            genhtml coverage.info --output-directory coverage_html 2>/dev/null || true
+            
+            # Also use gcovr for XML output
+            gcovr -r . \
+              --xml -o coverage.xml \
+              --html-details -o coverage.html \
+              --exclude-directories test \
+              --exclude-directories tests \
+              --print-summary 2>&1 | tee gcovr_output.txt || true
+          
+          elif [ "$BUILD_SYSTEM" = "make" ]; then
+            # Makefile build
+            make clean 2>/dev/null || true
+            make CXXFLAGS="--coverage -g -O0" LDFLAGS="--coverage" all 2>&1 | tee make_output.txt
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > build_fail.txt
+              exit 0
+            fi
+            
+            # Run tests
+            make test 2>&1 | tee test_output.txt || ./test 2>&1 | tee test_output.txt || true
+            TEST_EXIT=$?
+            
+            # Generate coverage
+            gcovr -r . --xml -o coverage.xml --html-details -o coverage.html 2>/dev/null || true
+          
+          elif [ "$BUILD_SYSTEM" = "meson" ]; then
+            # Meson build
+            meson setup build --buildtype=debug -Db_coverage=true 2>&1 | tee meson_setup_output.txt
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > build_fail.txt
+              exit 0
+            fi
+            
+            cd build
+            meson compile 2>&1 | tee ../meson_compile_output.txt
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > ../build_fail.txt
+              cd ..
+              exit 0
+            fi
+            
+            # Run tests
+            meson test --verbose 2>&1 | tee ../meson_test_output.txt
+            TEST_EXIT=$?
+            
+            # Generate coverage
+            ninja coverage-xml 2>&1 | tee ../coverage_output.txt || true
+            cp coverage.xml .. 2>/dev/null || true
+            cp -r coverage_html .. 2>/dev/null || true
+            cd ..
+          fi
+          
+          if [ $TEST_EXIT -ne 0 ]; then
+            echo "TESTS_FAILED" > test_fail.txt
+          fi
+
+      - name: Run C++ mutation testing
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          set +e
+          
+          echo "=== Running mutation testing ==="
+          
+          python3 <<'CPP_MUTATOR'
+import os
+import re
+import subprocess
+import json
+
+mutations = []
+source_files = []
+
+# Find source files
+for root, dirs, files in os.walk('.'):
+    if 'test' in root or 'tests' in root or 'build' in root:
+        continue
+    for file in files:
+        if file.endswith(('.cpp', '.cc', '.cxx')) and not file.endswith('_test.cpp'):
+            source_files.append(os.path.join(root, file))
+
+# Define mutation operators
+operators = [
+    (r'\b==\b', '!=', 'Equality to Inequality'),
+    (r'\b!=\b', '==', 'Inequality to Equality'),
+    (r'\b<\b', '<=', 'Less Than to Less Equal'),
+    (r'\b>\b', '>=', 'Greater Than to Greater Equal'),
+    (r'\+\+(?!\w)', '--', 'Increment to Decrement'),
+    (r'--(?!\w)', '++', 'Decrement to Increment'),
+    (r'\b&&\b', '||', 'AND to OR'),
+    (r'\b\|\|\b', '&&', 'OR to AND'),
+    (r'\btrue\b', 'false', 'True to False'),
+    (r'\bfalse\b', 'true', 'False to True'),
+]
+
+killed = 0
+survived = 0
+
+BUILD_SYSTEM = os.environ.get('BUILD_SYSTEM', 'cmake')
+
+if BUILD_SYSTEM == 'cmake':
+    build_dir = 'build'
+    build_cmd = ['make', '-C', build_dir]
+    test_cmd = ['ctest', '--test-dir', build_dir, '--output-on-failure']
+elif BUILD_SYSTEM == 'make':
+    build_dir = '.'
+    build_cmd = ['make']
+    test_cmd = ['make', 'test']
+elif BUILD_SYSTEM == 'meson':
+    build_dir = 'build'
+    build_cmd = ['meson', 'compile', '-C', build_dir]
+    test_cmd = ['meson', 'test', '-C', build_dir, '--verbose']
+
+for source_file in source_files[:10]:  # Limit to 10 files for time
+    with open(source_file, 'r') as f:
+        original_content = f.read()
+    
+    for pattern, replacement, description in operators:
+        matches = list(re.finditer(pattern, original_content))
+        
+        for match in matches[:5]:  # Limit mutations per operator
+            # Create mutant
+            mutated = original_content[:match.start()] + replacement + original_content[match.end():]
+            
+            # Write mutant
+            with open(source_file, 'w') as f:
+                f.write(mutated)
+            
+            # Try to compile and test
+            try:
+                compile_result = subprocess.run(build_cmd, capture_output=True, text=True, timeout=30)
+                
+                if compile_result.returncode == 0:
+                    test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=30)
+                    
+                    if test_result.returncode != 0:
+                        killed += 1
+                        status = 'killed'
+                    else:
+                        survived += 1
+                        status = 'survived'
+                else:
+                    killed += 1  # Compilation failure counts as killed
+                    status = 'killed'
+            except subprocess.TimeoutExpired:
+                killed += 1
+                status = 'timeout'
+            except Exception as e:
+                print(f"Error mutating {source_file}: {e}")
+                killed += 1
+                status = 'killed'
+            
+            mutations.append({
+                'file': source_file,
+                'line': original_content[:match.start()].count('\n') + 1,
+                'operator': description,
+                'status': status
+            })
+            
+            # Restore original
+            with open(source_file, 'w') as f:
+                f.write(original_content)
+
+# Save results
+with open('mutations.json', 'w') as f:
+    json.dump({'mutants': mutations, 'summary': {'killed': killed, 'survived': survived}}, f, indent=2)
+
+if killed + survived > 0:
+    score = (killed / (killed + survived)) * 100
+    print(f"Mutation Score: {score:.2f}% ({killed} killed, {survived} survived)")
+else:
+    print("No mutations applied")
+CPP_MUTATOR
+
+      - name: Detect C++ test smells
+        if: ${{ github.event.inputs.language == 'cpp' }}
+        run: |
+          echo "=== Detecting C++ Test Smells ==="
+          
+          TOTAL_SMELLS=0
+          
+          # Find test files
+          TEST_FILES=$(find . -name "*test*.cpp" -o -name "*test*.cc" -o -name "*_test.cpp" -o -name "*_test.cc" | grep -v build | grep -v tests | grep -v test)
+          
+          # Run cppcheck on tests
+          if [ -n "$TEST_FILES" ]; then
+            cppcheck --enable=style,warning --suppress=missingIncludeSystem $TEST_FILES 2> cppcheck_smells.txt || true
+            CPPCHECK_COUNT=$(grep -c "error\|warning\|style" cppcheck_smells.txt 2>/dev/null || echo 0)
+          else
+            CPPCHECK_COUNT=0
+            echo "No test files found for cppcheck" > cppcheck_smells.txt
+          fi
+          TOTAL_SMELLS=$((TOTAL_SMELLS + CPPCHECK_COUNT))
+          
+          # Custom smell detection
+          rm -f empty_tests.txt no_assert.txt todo_tests.txt magic_numbers.txt
+          
+          if [ -n "$TEST_FILES" ]; then
+            for file in $TEST_FILES; do
+              # Empty tests
+              grep -n "TEST.*{[[:space:]]*}" "$file" >> empty_tests.txt 2>/dev/null || true
+              
+              # Tests without assertions
+              awk '/TEST.*{/,/^}/ {print}' "$file" > temp_test_block.txt
+              if ! grep -qE "EXPECT|ASSERT|CHECK|REQUIRE" temp_test_block.txt; then
+                echo "$file: No assertions in test block" >> no_assert.txt
+              fi
+              
+              # TODO/FIXME
+              grep -n -i "TODO\|FIXME" "$file" >> todo_tests.txt 2>/dev/null || true
+              
+              # Magic numbers (exclude 0, 1, 2)
+              grep -n "[^0-9][3-9][0-9]\{2,\}[^0-9]" "$file" >> magic_numbers.txt 2>/dev/null || true
+            done
+          fi
+          
+          rm -f temp_test_block.txt 2>/dev/null
+          
+          CUSTOM_COUNT=$(cat empty_tests.txt no_assert.txt todo_tests.txt magic_numbers.txt 2>/dev/null | wc -l || echo 0)
+          TOTAL_SMELLS=$((TOTAL_SMELLS + CUSTOM_COUNT))
+          
+          echo $TOTAL_SMELLS > test_smells.txt
+          echo "Total C++ test smells: $TOTAL_SMELLS"
+
+      # =======================
+      # Java Configuration
+      # =======================
+      - name: Setup JDK
+        if: ${{ github.event.inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Configure Java build tools
+        if: ${{ github.event.inputs.language == 'java' }}
+        run: |
+          set +e
+          
+          BUILD_TOOL=""
+          if [ -f "pom.xml" ]; then
+            BUILD_TOOL="maven"
+            # Install xmlstarlet for XML manipulation
+            sudo apt-get install -y xmlstarlet
+            # Add JaCoCo if missing
+            if ! grep -q "jacoco-maven-plugin" pom.xml; then
+              echo "Adding JaCoCo plugin to pom.xml"
+              xmlstarlet ed -P -s "/project/build/plugins" -t elem -n plugin -v "" pom.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n groupId -v "org.jacoco" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n artifactId -v "jacoco-maven-plugin" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n version -v "0.8.12" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n executions -v "" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//executions[last()]" -t elem -n execution -v "" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//execution[last()]" -t elem -n goals -v "" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//goals[last()]" -t elem -n goal -v "prepare-agent" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//goals[last()]" -t elem -n goal -v "report" pom_temp2.xml > pom_temp.xml
+              mv pom_temp.xml pom.xml
+              rm -f pom_temp2.xml
+            fi
+            # Add PIT if missing
+            if ! grep -q "pitest-maven" pom.xml; then
+              echo "Adding PIT plugin to pom.xml"
+              xmlstarlet ed -P -s "/project/build/plugins" -t elem -n plugin -v "" pom.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n groupId -v "org.pitest" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n artifactId -v "pitest-maven" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n version -v "1.16.1" pom_temp.xml > pom_temp2.xml
+              mv pom_temp2.xml pom.xml
+              rm -f pom_temp.xml
+            fi
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            BUILD_TOOL="gradle"
+            # Add JaCoCo and PIT to build.gradle if missing
+            if [ -f "build.gradle" ]; then
+              if ! grep -q "jacoco" build.gradle; then
+                echo "plugins { id 'jacoco' }" >> build.gradle
+                echo "jacocoTestReport { reports { xml.enabled true; html.enabled true } }" >> build.gradle
+              fi
+              if ! grep -q "pitest" build.gradle; then
+                echo "plugins { id 'info.solidsoft.pitest' version '1.15.0' }" >> build.gradle
+                echo "pitest { outputFormats = ['XML', 'HTML'] }" >> build.gradle
+              fi
+            elif [ -f "build.gradle.kts" ]; then
+              if ! grep -q "jacoco" build.gradle.kts; then
+                echo "plugins { jacoco }" >> build.gradle.kts
+                echo "tasks.jacocoTestReport { reports { xml.enabled(true); html.enabled(true) } }" >> build.gradle.kts
+              fi
+              if ! grep -q "pitest" build.gradle.kts; then
+                echo "plugins { id(\"info.solidsoft.pitest\") version \"1.15.0\" }" >> build.gradle.kts
+                echo "pitest { outputFormats.set(listOf(\"XML\", \"HTML\")) }" >> build.gradle.kts
+              fi
+            fi
+          else
+            echo "No supported build system found" | tee build_output.txt
+            echo "BUILD_FAILED" > build_fail.txt
+            exit 0
+          fi
+          
+          echo "BUILD_TOOL=$BUILD_TOOL" >> $GITHUB_ENV
+
+      - name: Run Java tests with comprehensive metrics
+        if: ${{ github.event.inputs.language == 'java' }}
+        run: |
+          set +e
+          
+          if [ "${{ env.BUILD_TOOL }}" = "maven" ]; then
+            # Clean compile
+            mvn clean compile 2>&1 | tee compile_output.txt
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > build_fail.txt
+              exit 0
+            fi
+            
+            # Run tests with JaCoCo
+            mvn test jacoco:report 2>&1 | tee test_output.txt
+            TEST_EXIT=$?
+            
+            if [ $TEST_EXIT -ne 0 ]; then
+              echo "TESTS_FAILED" > test_fail.txt
+            fi
+            
+            # Generate reports
+            mvn jacoco:report 2>&1 | tee jacoco_report_output.txt || true
+            
+            # Run mutation testing
+            mvn org.pitest:pitest-maven:mutationCoverage \
+              -DtargetClasses="*" \
+              -DtargetTests="*Test" \
+              -DoutputFormats=XML,HTML \
+              -DtimestampedReports=false \
+              2>&1 | tee pitest_output.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+          
+          elif [ "${{ env.BUILD_TOOL }}" = "gradle" ]; then
+            # Gradle commands
+            ./gradlew clean build 2>&1 | tee build_output.txt
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > build_fail.txt
+              exit 0
+            fi
+            
+            ./gradlew test jacocoTestReport 2>&1 | tee test_output.txt
+            TEST_EXIT=$?
+            
+            if [ $TEST_EXIT -ne 0 ]; then
+              echo "TESTS_FAILED" > test_fail.txt
+            fi
+            
+            # Run mutation testing with PIT
+            ./gradlew pitest 2>&1 | tee pitest_output.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+          fi
+
+      - name: Detect Java test smells
+        if: ${{ github.event.inputs.language == 'java' }}
+        run: |
+          echo "=== Detecting Java Test Smells ==="
+          set +e
+          
+          # Find all test directories to handle multi-module projects
+          TEST_DIRS=$(find . -type d -name "test" -o -name "tests" | grep -v target | grep -v build)
+          
+          if [ -n "$TEST_DIRS" ]; then
+            # Download TestSmellDetector
+            curl -L https://github.com/TestSmells/TestSmellDetector/releases/download/v1.0/TestSmellDetector.jar -o TestSmellDetector.jar 2>/dev/null
+            for dir in $TEST_DIRS; do
+              echo "Analyzing test directory: $dir"
+              java -jar TestSmellDetector.jar -i "$dir" -o "java_smells_$(basename $dir).txt" 2>/dev/null || true
+            done
+            # Combine smell reports
+            cat java_smells_*.txt > java_smells.txt 2>/dev/null || echo "No smells detected" > java_smells.txt
+          else
+            echo "NO_TESTS_FOUND" > java_smells.txt
+          fi
+
+      # =======================
+      # Kotlin Configuration
+      # =======================
+      - name: Setup JDK for Kotlin
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Configure Kotlin build tools
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        run: |
+          set +e
+          
+          BUILD_TOOL=""
+          if [ -f "pom.xml" ]; then
+            BUILD_TOOL="maven"
+            # Install xmlstarlet for XML manipulation
+            sudo apt-get install -y xmlstarlet
+            # Add JaCoCo if missing
+            if ! grep -q "jacoco-maven-plugin" pom.xml; then
+              echo "Adding JaCoCo plugin to pom.xml"
+              xmlstarlet ed -P -s "/project/build/plugins" -t elem -n plugin -v "" pom.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n groupId -v "org.jacoco" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n artifactId -v "jacoco-maven-plugin" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n version -v "0.8.12" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//executions[last()]" -t elem -n execution -v "" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//execution[last()]" -t elem -n goals -v "" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//goals[last()]" -t elem -n goal -v "prepare-agent" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//goals[last()]" -t elem -n goal -v "report" pom_temp2.xml > pom_temp.xml
+              mv pom_temp.xml pom.xml
+              rm -f pom_temp2.xml
+            fi
+            # Add PIT if missing
+            if ! grep -q "pitest-maven" pom.xml; then
+              echo "Adding PIT plugin to pom.xml"
+              xmlstarlet ed -P -s "/project/build/plugins" -t elem -n plugin -v "" pom.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n groupId -v "org.pitest" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n artifactId -v "pitest-maven" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n version -v "1.16.1" pom_temp.xml > pom_temp2.xml
+              mv pom_temp2.xml pom.xml
+              rm -f pom_temp.xml
+            fi
+            # Add Kotlin surefire for tests
+            if ! grep -q "maven-surefire-plugin" pom.xml; then
+              echo "Adding Surefire plugin to pom.xml"
+              xmlstarlet ed -P -s "/project/build/plugins" -t elem -n plugin -v "" pom.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n groupId -v "org.apache.maven.plugins" pom_temp.xml > pom_temp2.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n artifactId -v "maven-surefire-plugin" pom_temp2.xml > pom_temp.xml
+              xmlstarlet ed -P -s "//plugin[last()]" -t elem -n version -v "3.3.1" pom_temp.xml > pom_temp2.xml
+              mv pom_temp2.xml pom.xml
+              rm -f pom_temp.xml
+            fi
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            BUILD_TOOL="gradle"
+            # Add JaCoCo, PIT, and Detekt to build.gradle if missing
+            if [ -f "build.gradle" ]; then
+              if ! grep -q "jacoco" build.gradle; then
+                echo "plugins { id 'jacoco' }" >> build.gradle
+                echo "jacocoTestReport { reports { xml.enabled true; html.enabled true } }" >> build.gradle
+              fi
+              if ! grep -q "pitest" build.gradle; then
+                echo "plugins { id 'info.solidsoft.pitest' version '1.15.0' }" >> build.gradle
+                echo "pitest { outputFormats = ['XML', 'HTML'] }" >> build.gradle
+              fi
+              if ! grep -q "detekt" build.gradle; then
+                echo "plugins { id 'io.gitlab.arturbosch.detekt' version '1.23.6' }" >> build.gradle
+                echo "detekt { reports { xml.enabled true; html.enabled true } }" >> build.gradle
+              fi
+            elif [ -f "build.gradle.kts" ]; then
+              if ! grep -q "jacoco" build.gradle.kts; then
+                echo "plugins { jacoco }" >> build.gradle.kts
+                echo "tasks.jacocoTestReport { reports { xml.enabled(true); html.enabled(true) } }" >> build.gradle.kts
+              fi
+              if ! grep -q "pitest" build.gradle.kts; then
+                echo "plugins { id(\"info.solidsoft.pitest\") version \"1.15.0\" }" >> build.gradle.kts
+                echo "pitest { outputFormats.set(listOf(\"XML\", \"HTML\")) }" >> build.gradle.kts
+              fi
+              if ! grep -q "detekt" build.gradle.kts; then
+                echo "plugins { id(\"io.gitlab.arturbosch.detekt\") version \"1.23.6\" }" >> build.gradle.kts
+                echo "detekt { reports { xml.enabled(true); html.enabled(true) } }" >> build.gradle.kts
+              fi
+            fi
+          else
+            echo "No supported build system found" | tee build_output.txt
+            echo "BUILD_FAILED" > build_fail.txt
+            exit 0
+          fi
+          
+          echo "BUILD_TOOL=$BUILD_TOOL" >> $GITHUB_ENV
+
+      - name: Run Kotlin tests with comprehensive metrics
+        if: ${{ github.event.inputs.language == 'kotlin' }}
+        run: |
+          set +e
+          
+          if [ "${{ env.BUILD_TOOL }}" = "maven" ]; then
+            # Clean compile
+            mvn clean compile 2>&1 | tee compile_output.txt
+            if [ $? -ne 0 ]; then
+              echo "BUILD_FAILED" > build_fail.txt
+              exit 0
+            fi
+            
+            # Run tests with JaCoCo
+            mvn test jacoco:report 2>&1 | tee test_output.txt
+            TEST_EXIT=$?
+            
+            if [ $TEST_EXIT -ne 0 ]; then
+              echo "TESTS_FAILED" > test_fail.txt
+            fi
+            
+            # Generate reports
+            mvn jacoco:report 2>&1 | tee jacoco_report_output.txt || true
+            
+            # Run mutation testing
+            mvn org.pitest:pitest-maven:mutationCoverage \
+              -DtargetClasses="*" \
+              -DtargetTests="*Test" \
+              -DoutputFormats=XML,HTML \
+              -DtimestampedReports=false \
+              2>&1 | tee pitest_output.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+          
+          elif [ "${{ env.BUILD_TOOL }}" = "gradle" ]; then
+            # Gradle commands
+            ./gradlew clean build jacocoTestReport 2>&1 | tee kotlin_test_output.txt
+            TEST_EXIT=$?
+            
+            if [ $TEST_EXIT -ne 0 ]; then
+              echo "TESTS_FAILED" > test_fail.txt
+            fi
+            
+            ./gradlew pitest 2>&1 | tee kotlin_pitest_output.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+            ./gradlew detekt 2>&1 | tee detekt_output.txt || true
+            cp build/reports/detekt/detekt.xml detekt_report.xml 2>/dev/null || true
+          fi
+
+      # =======================
+      # Go Configuration
+      # =======================
+      - name: Setup Go
+        if: ${{ github.event.inputs.language == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Run Go tests with coverage and mutation
+        if: ${{ github.event.inputs.language == 'go' }}
+        run: |
+          set +e
+          
+          # Build
+          go build ./... 2>&1 | tee compile_output.txt
+          if [ $? -ne 0 ]; then
+            echo "BUILD_FAILED" > build_fail.txt
+            exit 0
+          fi
+          
+          # Run tests with coverage
+          go test ./... -v -coverprofile=coverage.out -covermode=count 2>&1 | tee test_output.txt
+          TEST_EXIT=$?
+          
+          if [ $TEST_EXIT -ne 0 ]; then
+            echo "TESTS_FAILED" > test_fail.txt
+          fi
+          
+          # Generate HTML coverage report
+          go tool cover -html=coverage.out -o coverage.html 2>/dev/null || true
+          
+          # Run mutation testing
+          go install github.com/gtramontina/ooze@latest 2>/dev/null
+          ooze run ./... 2>&1 | tee go_mutation.txt || echo "MUTATION_FAILED" > mutation_fail.txt
+          
+          # Run static analysis
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest 2>/dev/null
+          golangci-lint run ./... --out-format checkstyle > golangci-lint.xml 2>/dev/null || true
+
+      # =======================
+      # Collect and Upload
+      # =======================
+      - name: Collect reports
+        if: always()
+        run: |
+          mkdir -p reports
+          cp -r *.xml *.txt *.html *.out *.info *.json coverage* mutation* *output.txt pit-reports build/reports reports/ 2>/dev/null || true
+
+      - name: Upload consolidated reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-${{ github.event.inputs.pr_number }}-metrics
+          path: reports
+          retention-days: 30
+
+      # =======================
+      # Debug and Summarize
+      # =======================
+      - name: Debug file structure
+        if: always()
+        run: |
+          echo "=== Current directory structure ==="
+          ls -la
+          echo ""
+          echo "=== Coverage files ==="
+          find . -name "coverage*" -type f 2>/dev/null | head -20
+          echo ""
+          echo "=== Test output files ==="
+          find . -name "*test*.txt" -o -name "*test*.xml" 2>/dev/null | head -20
+          echo ""
+          echo "=== Mutation files ==="
+          find . -name "*mutation*" -o -name "*mutant*" -o -name "*pit-reports*" 2>/dev/null | head -20
+
+      - name: Parse and summarize metrics
+        if: always()
+        run: |
+          python3 <<'EOF'
+import json
+import os
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from bs4 import BeautifulSoup
+
+metrics = {
+    "language": os.environ.get("GITHUB_EVENT_INPUTS_LANGUAGE", "unknown"),
+    "build_status": "success" if not Path("build_fail.txt").exists() else "failed",
+    "test_status": "success" if not Path("test_fail.txt").exists() else "failed",
+    "mutation_status": "success" if not Path("mutation_fail.txt").exists() else "failed",
+    "coverage": {
+        "line": 0.0,
+        "branch": 0.0
+    },
+    "mutation_score": 0.0,
+    "test_smells": 0
+}
+
+# Parse coverage
+coverage_files = [
+    "coverage.xml",  # Python, C++
+    "target/site/jacoco/jacoco.xml",  # Maven
+    "build/reports/jacoco/test/jacocoTestReport.xml"  # Gradle
+]
+for cov_file in coverage_files:
+    if Path(cov_file).exists():
+        try:
+            tree = ET.parse(cov_file)
+            root = tree.getroot()
+            metrics["coverage"]["line"] = float(root.attrib.get("line-rate", 0)) * 100
+            metrics["coverage"]["branch"] = float(root.attrib.get("branch-rate", 0)) * 100
+            break
+        except Exception as e:
+            print(f"Error parsing {cov_file}: {e}")
+
+# Go coverage
+if Path("coverage.out").exists():
+    with open("coverage.out", "r") as f:
+        lines = f.readlines()
+        for line in lines:
+            if "coverage:" in line:
+                metrics["coverage"]["line"] = float(line.split("coverage:")[1].strip().split("%")[0])
+                break
+
+# Parse mutation score
+if Path("mutation_score.txt").exists():  # Python
+    with open("mutation_score.txt", "r") as f:
+        for line in f:
+            if "Mutation Score:" in line:
+                metrics["mutation_score"] = float(line.split(":")[1].strip().split("%")[0])
+                break
+
+elif Path("mutations.json").exists():  # C++
+    with open("mutations.json", "r") as f:
+        data = json.load(f)
+        summary = data.get("summary", {})
+        killed = summary.get("killed", 0)
+        survived = summary.get("survived", 0)
+        total = killed + survived
+        if total > 0:
+            metrics["mutation_score"] = (killed / total) * 100
+
+elif Path("go_mutation.txt").exists():  # Go
+    with open("go_mutation.txt", "r") as f:
+        for line in f:
+            if "Mutation Score:" in line:
+                metrics["mutation_score"] = float(line.split(":")[1].strip().split("%")[0])
+                break
+
+# Java/Kotlin PIT reports
+pit_dirs = ["pit-reports", "build/reports/pitest"]
+for pit_dir in pit_dirs:
+    if Path(pit_dir).exists():
+        for pit_html in Path(pit_dir).rglob("index.html"):
+            try:
+                with open(pit_html, "r") as f:
+                    soup = BeautifulSoup(f.read(), "html.parser")
+                    line_coverage = soup.find(string="Line Coverage:")
+                    if line_coverage:
+                        metrics["coverage"]["line"] = float(line_coverage.find_parent().find_next_sibling().text.split("%")[0].strip())
+                    mutation_coverage = soup.find(string="Mutation Coverage:")
+                    if mutation_coverage:
+                        metrics["mutation_score"] = float(mutation_coverage.find_parent().find_next_sibling().text.split("%")[0].strip())
+                break
+            except Exception as e:
+                print(f"Error parsing PIT report {pit_html}: {e}")
+
+# Parse test smells
+if Path("test_smells.txt").exists():  # Python, C++
+    with open("test_smells.txt", "r") as f:
+        try:
+            metrics["test_smells"] = int(f.read().strip())
+        except ValueError:
+            metrics["test_smells"] = 0
+
+elif Path("java_smells.txt").exists():  # Java
+    with open("java_smells.txt", "r") as f:
+        metrics["test_smells"] = len([line for line in f if line.strip() and not line.startswith("No smells detected")])
+
+elif Path("detekt_report.xml").exists():  # Kotlin
+    try:
+        tree = ET.parse("detekt_report.xml")
+        root = tree.getroot()
+        metrics["test_smells"] = len(root.findall(".//error"))
+    except Exception as e:
+        print(f"Error parsing detekt_report.xml: {e}")
+
+elif Path("golangci-lint.xml").exists():  # Go
+    try:
+        tree = ET.parse("golangci-lint.xml")
+        root = tree.getroot()
+        metrics["test_smells"] = len(root.findall(".//issue"))
+    except Exception as e:
+        print(f"Error parsing golangci-lint.xml: {e}")
+
+# Save JSON
+with open("metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
+
+# Generate Markdown summary
+with open("metrics_summary.md", "w") as f:
+    f.write("# Test Metrics Summary\n\n")
+    f.write(f"**Language:** {metrics['language']}\n\n")
+    f.write(f"**Build Status:** {metrics['build_status'].capitalize()}\n\n")
+    f.write(f"**Test Status:** {metrics['test_status'].capitalize()}\n\n")
+    f.write(f"**Mutation Status:** {metrics['mutation_status'].capitalize()}\n\n")
+    f.write("## Coverage\n")
+    f.write(f"- Line: {metrics['coverage']['line']:.2f}%\n")
+    f.write(f"- Branch: {metrics['coverage']['branch']:.2f}%\n\n")
+    f.write(f"## Mutation Score: {metrics['mutation_score']:.2f}%\n\n")
+    f.write(f"## Test Smells: {metrics['test_smells']}\n")
+EOF
+
+      - name: Upload consolidated metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-${{ github.event.inputs.pr_number }}-metrics
+          path: |
+            reports
+            metrics.json
+            metrics_summary.md
+          retention-days: 30
+
+      - name: Generate job summary
+        if: always()
+        run: |
+          if [ -f "metrics_summary.md" ]; then
+            cat metrics_summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No metrics summary available" >> $GITHUB_STEP_SUMMARY
+          fi
