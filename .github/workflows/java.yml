@@ -1,4 +1,4 @@
-name: Java PR Test Metrics
+name: Java PR Tests
 
 on:
   workflow_dispatch:
@@ -15,74 +15,52 @@ on:
 jobs:
   java-tests:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.inputs.repo }}
-          ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
+      - name: Checkout PR
+        run: |
+          git clone https://github.com/${{ github.event.inputs.repo }} repo
+          cd repo
+          PR_NUMBER=${{ github.event.inputs.pr_number }}
+          PR_BRANCH=$(gh pr view $PR_NUMBER --repo ${{ github.event.inputs.repo }} --json headRefName -q .headRefName)
+          git fetch origin pull/$PR_NUMBER/head:$PR_BRANCH
+          git checkout $PR_BRANCH
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: 17
 
-      - name: Cache Maven packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
-
-      - name: Compile Project
+      - name: Build with Maven
         run: |
-          echo "=== Compiling Project ==="
-          mvn clean compile -DskipTests || echo "COMPILATION_FAILED" > compilation_fail.txt
+          cd repo
+          mvn -B clean install
+        continue-on-error: false
 
-      - name: Run Unit Tests
+      - name: Run Tests with Coverage
         run: |
-          echo "=== Running Unit Tests ==="
-          set +e
-          mvn test -Dsurefire.reportFormat=plain
-          RESULT=$?
-          if [ $RESULT -ne 0 ]; then
-            echo "TESTS_FAILED" > test_fail.txt
-          fi
-          exit 0
+          cd repo
+          mvn -B test jacoco:report
+        continue-on-error: false
 
-      - name: Run Code Coverage (JaCoCo)
+      - name: Mutation Testing (PIT)
         run: |
-          echo "=== Running JaCoCo Coverage ==="
-          mvn jacoco:prepare-agent test jacoco:report
-          mkdir -p reports/coverage
-          cp target/site/jacoco/index.html reports/coverage/index.html || true
-          cp -r target/site/jacoco/* reports/coverage/ || true
+          cd repo
+          mvn -B org.pitest:pitest-maven:mutationCoverage
+        continue-on-error: true
 
-      - name: Run Mutation Testing (PIT)
+      - name: Collect Results
         run: |
-          echo "=== Running PIT Mutation Testing ==="
-          set +e
-          mvn org.pitest:pitest-maven:mutationCoverage
-          RESULT=$?
-          if [ $RESULT -ne 0 ]; then
-            echo "MUTATION_FAILED" > mutation_fail.txt
-          fi
-          mkdir -p reports/mutation
-          cp -r target/pit-reports/* reports/mutation/ || true
-          exit 0
+          mkdir -p results
+          cp -r repo/target/site/jacoco results/ || true
+          cp -r repo/target/pit-reports results/ || true
+          echo "Compilation & Tests Successful" > results/status.txt
 
-      - name: Collect Reports
-        run: |
-          mkdir -p reports/status
-          if [ -f compilation_fail.txt ]; then cp compilation_fail.txt reports/status/; fi
-          if [ -f test_fail.txt ]; then cp test_fail.txt reports/status/; fi
-          if [ -f mutation_fail.txt ]; then cp mutation_fail.txt reports/status/; fi
-
-      - name: Upload Reports as Artifact
+      - name: Upload Results Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: java-pr-test-metrics
-          path: reports
+          name: java-test-results
+          path: results
+
