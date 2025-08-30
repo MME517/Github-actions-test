@@ -516,7 +516,7 @@ jobs:
             # Also use gcovr for XML output
             gcovr -r . \
               --xml -o coverage.xml \
-              --html-details -o coverage.html \
+              --html \--html-details \--output coverage.html
               --exclude-directories test \
               --exclude-directories tests \
               --print-summary 2>&1 | tee gcovr_output.txt || true
@@ -533,14 +533,25 @@ jobs:
             # Run tests
             make test 2>&1 | tee test_output.txt || ./test 2>&1 | tee test_output.txt || true
             TEST_EXIT=$?
-            
-            # Generate coverage
-            gcovr -r . --xml -o coverage.xml --html -o coverage.html 2>/dev/null || true
-          fi
-          
-          if [ $TEST_EXIT -ne 0 ]; then
-            echo "TESTS_FAILED" > test_fail.txt
-          fi
+
+            # Check if coverage files were generated
+            echo "=== Checking for coverage files ==="
+            find . -name "*.gcda" -type f | head -10
+            find . -name "*.gcno" -type f | head -10
+
+            # Generate coverage - FIXED HTML OUTPUT
+             gcovr -r . \
+               --xml-pretty \
+               --output coverage.xml \
+               --html \
+               --html-details \
+               --output coverage.html \
+               --print-summary 2>&1 | tee gcovr_output.txt || true
+             fi
+                 if [ $TEST_EXIT -ne 0 ]; then
+                   echo "TESTS_FAILED" > test_fail.txt
+           fi
+    
 
       - name: Run C++ mutation testing
         if: ${{ github.event.inputs.language == 'cpp' }}
