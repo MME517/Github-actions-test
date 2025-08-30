@@ -1,0 +1,88 @@
+name: Java PR Test Metrics
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository (e.g. owner/name)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+
+jobs:
+  java-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Compile Project
+        run: |
+          echo "=== Compiling Project ==="
+          mvn clean compile -DskipTests || echo "COMPILATION_FAILED" > compilation_fail.txt
+
+      - name: Run Unit Tests
+        run: |
+          echo "=== Running Unit Tests ==="
+          set +e
+          mvn test -Dsurefire.reportFormat=plain
+          RESULT=$?
+          if [ $RESULT -ne 0 ]; then
+            echo "TESTS_FAILED" > test_fail.txt
+          fi
+          exit 0
+
+      - name: Run Code Coverage (JaCoCo)
+        run: |
+          echo "=== Running JaCoCo Coverage ==="
+          mvn jacoco:prepare-agent test jacoco:report
+          mkdir -p reports/coverage
+          cp target/site/jacoco/index.html reports/coverage/index.html || true
+          cp -r target/site/jacoco/* reports/coverage/ || true
+
+      - name: Run Mutation Testing (PIT)
+        run: |
+          echo "=== Running PIT Mutation Testing ==="
+          set +e
+          mvn org.pitest:pitest-maven:mutationCoverage
+          RESULT=$?
+          if [ $RESULT -ne 0 ]; then
+            echo "MUTATION_FAILED" > mutation_fail.txt
+          fi
+          mkdir -p reports/mutation
+          cp -r target/pit-reports/* reports/mutation/ || true
+          exit 0
+
+      - name: Collect Reports
+        run: |
+          mkdir -p reports/status
+          if [ -f compilation_fail.txt ]; then cp compilation_fail.txt reports/status/; fi
+          if [ -f test_fail.txt ]; then cp test_fail.txt reports/status/; fi
+          if [ -f mutation_fail.txt ]; then cp mutation_fail.txt reports/status/; fi
+
+      - name: Upload Reports as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-pr-test-metrics
+          path: reports
