@@ -859,7 +859,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-${{ github.event.inputs.pr_number }}-metrics
-          path: reports
+          path: report
 
       # =======================
       # Debug and Artifacts
