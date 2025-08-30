@@ -1,72 +1,545 @@
-name: java-tests
+name: Java PR Quality Analysis
 
 on:
+  pull_request:
+    branches: [ main, master, develop ]
+    types: [ opened, synchronize, reopened ]
   workflow_dispatch:
     inputs:
-      repo:
-        description: "Repository (e.g. owner/name)"
-        required: true
-        type: string
       pr_number:
-        description: "Pull request number"
+        description: 'PR number to analyze'
         required: true
         type: string
+
+env:
+  JAVA_VERSION: '11'
+  MAVEN_OPTS: '-Xmx2g -Xms1g'
+  GRADLE_OPTS: '-Xmx2g -Xms1g'
 
 jobs:
-  java-tests:
+  analyze-pr:
+    name: Analyze Java PR Quality
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    
+    outputs:
+      quality-score: ${{ steps.analysis.outputs.quality-score }}
+      compilation-success: ${{ steps.analysis.outputs.compilation-success }}
+      test-success: ${{ steps.analysis.outputs.test-success }}
+      coverage-percentage: ${{ steps.analysis.outputs.coverage-percentage }}
+      mutation-score: ${{ steps.analysis.outputs.mutation-score }}
+    
     steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.inputs.repo }}
-          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
-          fetch-depth: 0
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: "21"
-          distribution: "temurin"
-
-      - name: Locate pom.xml
-        id: find-pom
-        run: |
-          if [ -f "pom.xml" ]; then
-            echo "pom_path=." >> $GITHUB_OUTPUT
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        cache: 'maven'
+    
+    - name: Setup Gradle Cache
+      if: hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') != ''
+      uses: gradle/gradle-build-action@v2
+      with:
+        cache-read-only: false
+    
+    - name: Detect Build System
+      id: build-system
+      run: |
+        if [ -f "pom.xml" ]; then
+          echo "system=maven" >> $GITHUB_OUTPUT
+          echo "📦 Detected Maven project"
+        elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+          echo "system=gradle" >> $GITHUB_OUTPUT
+          echo "📦 Detected Gradle project"
+          chmod +x gradlew || true
+        else
+          echo "❌ No supported build system found"
+          exit 1
+        fi
+    
+    - name: Add JaCoCo Plugin (Maven)
+      if: steps.build-system.outputs.system == 'maven'
+      run: |
+        if ! grep -q "jacoco" pom.xml; then
+          echo "📋 Adding JaCoCo plugin to pom.xml"
+          # Create backup
+          cp pom.xml pom.xml.backup
+          
+          # Add JaCoCo plugin before </plugins>
+          sed -i '/<\/plugins>/i\
+              <plugin>\
+                  <groupId>org.jacoco</groupId>\
+                  <artifactId>jacoco-maven-plugin</artifactId>\
+                  <version>0.8.8</version>\
+                  <executions>\
+                      <execution>\
+                          <goals>\
+                              <goal>prepare-agent</goal>\
+                          </goals>\
+                      </execution>\
+                      <execution>\
+                          <id>report</id>\
+                          <phase>test</phase>\
+                          <goals>\
+                              <goal>report</goal>\
+                          </goals>\
+                      </execution>\
+                  </executions>\
+              </plugin>' pom.xml
+        else
+          echo "✅ JaCoCo plugin already present"
+        fi
+    
+    - name: Add JaCoCo Plugin (Gradle)
+      if: steps.build-system.outputs.system == 'gradle'
+      run: |
+        BUILD_FILE=""
+        if [ -f "build.gradle" ]; then
+          BUILD_FILE="build.gradle"
+        elif [ -f "build.gradle.kts" ]; then
+          BUILD_FILE="build.gradle.kts"
+        fi
+        
+        if [ -n "$BUILD_FILE" ] && ! grep -q "jacoco" "$BUILD_FILE"; then
+          echo "📋 Adding JaCoCo plugin to $BUILD_FILE"
+          echo "" >> "$BUILD_FILE"
+          echo "apply plugin: 'jacoco'" >> "$BUILD_FILE"
+          echo "" >> "$BUILD_FILE"
+          echo "jacocoTestReport {" >> "$BUILD_FILE"
+          echo "    reports {" >> "$BUILD_FILE"
+          echo "        xml.enabled true" >> "$BUILD_FILE"
+          echo "        html.enabled true" >> "$BUILD_FILE"
+          echo "    }" >> "$BUILD_FILE"
+          echo "}" >> "$BUILD_FILE"
+        else
+          echo "✅ JaCoCo plugin already present or no build file found"
+        fi
+    
+    - name: Add PITest Plugin (Maven)
+      if: steps.build-system.outputs.system == 'maven'
+      run: |
+        if ! grep -q "pitest" pom.xml; then
+          echo "🦠 Adding PITest plugin to pom.xml"
+          sed -i '/<\/plugins>/i\
+              <plugin>\
+                  <groupId>org.pitest</groupId>\
+                  <artifactId>pitest-maven</artifactId>\
+                  <version>1.15.3</version>\
+                  <configuration>\
+                      <targetClasses>\
+                          <param>*</param>\
+                      </targetClasses>\
+                      <targetTests>\
+                          <param>*</param>\
+                      </targetTests>\
+                      <timeoutConstant>4000</timeoutConstant>\
+                      <timeoutFactor>1.25</timeoutFactor>\
+                      <outputFormats>\
+                          <outputFormat>XML</outputFormat>\
+                          <outputFormat>HTML</outputFormat>\
+                      </outputFormats>\
+                  </configuration>\
+              </plugin>' pom.xml
+        else
+          echo "✅ PITest plugin already present"
+        fi
+    
+    - name: Add PITest Plugin (Gradle)
+      if: steps.build-system.outputs.system == 'gradle'
+      run: |
+        BUILD_FILE=""
+        if [ -f "build.gradle" ]; then
+          BUILD_FILE="build.gradle"
+        elif [ -f "build.gradle.kts" ]; then
+          BUILD_FILE="build.gradle.kts"
+        fi
+        
+        if [ -n "$BUILD_FILE" ] && ! grep -q "pitest" "$BUILD_FILE"; then
+          echo "🦠 Adding PITest plugin to $BUILD_FILE"
+          echo "" >> "$BUILD_FILE"
+          echo "plugins {" >> "$BUILD_FILE"
+          echo "    id 'info.solidsoft.pitest' version '1.15.0'" >> "$BUILD_FILE"
+          echo "}" >> "$BUILD_FILE"
+          echo "" >> "$BUILD_FILE"
+          echo "pitest {" >> "$BUILD_FILE"
+          echo "    targetClasses = ['*']" >> "$BUILD_FILE"
+          echo "    timeoutConstant = 4000" >> "$BUILD_FILE"
+          echo "    timeoutFactor = 1.25" >> "$BUILD_FILE"
+          echo "    outputFormats = ['XML', 'HTML']" >> "$BUILD_FILE"
+          echo "}" >> "$BUILD_FILE"
+        else
+          echo "✅ PITest plugin already present or no build file found"
+        fi
+    
+    - name: Compile Project
+      id: compilation
+      run: |
+        echo "🔨 Compiling project..."
+        BUILD_SYSTEM="${{ steps.build-system.outputs.system }}"
+        
+        if [ "$BUILD_SYSTEM" = "maven" ]; then
+          if mvn clean compile test-compile -q; then
+            echo "✅ Maven compilation successful"
+            echo "success=true" >> $GITHUB_OUTPUT
           else
-            POM_FILE=$(find . -name "pom.xml" | head -n 1)
-            if [ -z "$POM_FILE" ]; then
-              echo "❌ No pom.xml found in repository"
-              exit 1
-            fi
-            DIR=$(dirname "$POM_FILE")
-            echo "pom_path=$DIR" >> $GITHUB_OUTPUT
+            echo "❌ Maven compilation failed"
+            echo "success=false" >> $GITHUB_OUTPUT
           fi
+        else
+          if ./gradlew clean compileJava compileTestJava --console=plain; then
+            echo "✅ Gradle compilation successful"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Gradle compilation failed"
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+        fi
+    
+    - name: Run Tests
+      id: tests
+      if: steps.compilation.outputs.success == 'true'
+      run: |
+        echo "🧪 Running tests..."
+        BUILD_SYSTEM="${{ steps.build-system.outputs.system }}"
+        
+        if [ "$BUILD_SYSTEM" = "maven" ]; then
+          if mvn test -q; then
+            echo "✅ Maven tests passed"
+            echo "success=true" >> $GITHUB_OUTPUT
+            
+            # Extract test metrics
+            TEST_COUNT=$(mvn surefire-report:report -q 2>/dev/null | grep -oE "Tests run: [0-9]+" | grep -oE "[0-9]+" | head -1 || echo "0")
+            FAILED_TESTS=$(mvn surefire-report:report -q 2>/dev/null | grep -oE "Failures: [0-9]+" | grep -oE "[0-9]+" | head -1 || echo "0")
+            
+            echo "test-count=$TEST_COUNT" >> $GITHUB_OUTPUT
+            echo "failed-tests=$FAILED_TESTS" >> $GITHUB_OUTPUT
+            echo "📊 Tests: $TEST_COUNT total, $FAILED_TESTS failed"
+          else
+            echo "❌ Maven tests failed"
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+        else
+          if ./gradlew test --console=plain; then
+            echo "✅ Gradle tests passed"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Gradle tests failed"
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+        fi
+    
+    - name: Calculate Coverage
+      id: coverage
+      if: steps.compilation.outputs.success == 'true'
+      run: |
+        echo "📈 Calculating code coverage..."
+        BUILD_SYSTEM="${{ steps.build-system.outputs.system }}"
+        
+        if [ "$BUILD_SYSTEM" = "maven" ]; then
+          if mvn jacoco:report -q; then
+            echo "✅ Maven coverage calculation successful"
+            echo "success=true" >> $GITHUB_OUTPUT
+            
+            # Extract coverage percentage
+            if [ -f "target/site/jacoco/index.html" ]; then
+              COVERAGE=$(grep -oE '[0-9]+%' target/site/jacoco/index.html | head -1 | sed 's/%//' || echo "0")
+            else
+              COVERAGE="0"
+            fi
+            
+            echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+            echo "📊 Coverage: $COVERAGE%"
+          else
+            echo "❌ Maven coverage calculation failed"
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "percentage=0" >> $GITHUB_OUTPUT
+          fi
+        else
+          if ./gradlew jacocoTestReport --console=plain; then
+            echo "✅ Gradle coverage calculation successful"
+            echo "success=true" >> $GITHUB_OUTPUT
+            
+            # Extract coverage percentage
+            if [ -f "build/reports/jacoco/test/html/index.html" ]; then
+              COVERAGE=$(grep -oE '[0-9]+%' build/reports/jacoco/test/html/index.html | head -1 | sed 's/%//' || echo "0")
+            else
+              COVERAGE="0"
+            fi
+            
+            echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+            echo "📊 Coverage: $COVERAGE%"
+          else
+            echo "❌ Gradle coverage calculation failed"
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "percentage=0" >> $GITHUB_OUTPUT
+          fi
+        fi
+    
+    - name: Run Mutation Testing
+      id: mutation
+      if: steps.compilation.outputs.success == 'true' && steps.tests.outputs.success == 'true'
+      timeout-minutes: 10
+      continue-on-error: true
+      run: |
+        echo "🦠 Running mutation testing..."
+        BUILD_SYSTEM="${{ steps.build-system.outputs.system }}"
+        
+        if [ "$BUILD_SYSTEM" = "maven" ]; then
+          if timeout 600 mvn org.pitest:pitest-maven:mutationCoverage -q; then
+            echo "✅ Maven mutation testing completed"
+            echo "success=true" >> $GITHUB_OUTPUT
+            
+            # Extract mutation score
+            MUTATION_SCORE="0"
+            if [ -f "target/pit-reports/mutations.xml" ]; then
+              MUTATION_SCORE=$(grep -oE 'mutationCoverage="[0-9]+"' target/pit-reports/mutations.xml | grep -oE '[0-9]+' || echo "0")
+            fi
+            
+            echo "score=$MUTATION_SCORE" >> $GITHUB_OUTPUT
+            echo "📊 Mutation Score: $MUTATION_SCORE%"
+          else
+            echo "⚠️ Maven mutation testing failed or timed out"
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "score=0" >> $GITHUB_OUTPUT
+          fi
+        else
+          if timeout 600 ./gradlew pitest --console=plain; then
+            echo "✅ Gradle mutation testing completed"
+            echo "success=true" >> $GITHUB_OUTPUT
+            
+            # Extract mutation score (simplified)
+            echo "score=0" >> $GITHUB_OUTPUT
+            echo "📊 Mutation testing completed"
+          else
+            echo "⚠️ Gradle mutation testing failed or timed out"
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "score=0" >> $GITHUB_OUTPUT
+          fi
+        fi
+    
+    - name: Calculate Quality Score
+      id: analysis
+      run: |
+        echo "🏆 Calculating quality score..."
+        
+        COMPILATION_SUCCESS="${{ steps.compilation.outputs.success }}"
+        TEST_SUCCESS="${{ steps.tests.outputs.success }}"
+        COVERAGE_PCT="${{ steps.coverage.outputs.percentage }}"
+        MUTATION_SCORE="${{ steps.mutation.outputs.score }}"
+        
+        # Default values
+        COVERAGE_PCT=${COVERAGE_PCT:-0}
+        MUTATION_SCORE=${MUTATION_SCORE:-0}
+        
+        QUALITY_SCORE=0
+        
+        # Compilation success (25 points)
+        if [ "$COMPILATION_SUCCESS" = "true" ]; then
+          QUALITY_SCORE=$((QUALITY_SCORE + 25))
+        fi
+        
+        # Test success (25 points)
+        if [ "$TEST_SUCCESS" = "true" ]; then
+          QUALITY_SCORE=$((QUALITY_SCORE + 25))
+        fi
+        
+        # Coverage (25 points max, scaled)
+        COVERAGE_POINTS=$((COVERAGE_PCT * 25 / 100))
+        QUALITY_SCORE=$((QUALITY_SCORE + COVERAGE_POINTS))
+        
+        # Mutation testing (25 points max, scaled)
+        MUTATION_POINTS=$((MUTATION_SCORE * 25 / 100))
+        QUALITY_SCORE=$((QUALITY_SCORE + MUTATION_POINTS))
+        
+        echo "quality-score=$QUALITY_SCORE" >> $GITHUB_OUTPUT
+        echo "compilation-success=$COMPILATION_SUCCESS" >> $GITHUB_OUTPUT
+        echo "test-success=$TEST_SUCCESS" >> $GITHUB_OUTPUT
+        echo "coverage-percentage=$COVERAGE_PCT" >> $GITHUB_OUTPUT
+        echo "mutation-score=$MUTATION_SCORE" >> $GITHUB_OUTPUT
+        
+        echo "📊 Final Quality Score: $QUALITY_SCORE/100"
+    
+    - name: Generate Report Artifact
+      run: |
+        mkdir -p analysis-results
+        
+        cat > analysis-results/quality-report.json <<EOF
+        {
+          "repository": "${{ github.repository }}",
+          "pr_number": "${{ github.event.pull_request.number || inputs.pr_number }}",
+          "commit_sha": "${{ github.event.pull_request.head.sha || github.sha }}",
+          "analysis_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "build_system": "${{ steps.build-system.outputs.system }}",
+          "results": {
+            "compilation": {
+              "success": ${{ steps.compilation.outputs.success }},
+              "points": ${{ steps.compilation.outputs.success == 'true' && 25 || 0 }}
+            },
+            "testing": {
+              "success": ${{ steps.tests.outputs.success }},
+              "test_count": ${{ steps.tests.outputs.test-count || 0 }},
+              "failed_tests": ${{ steps.tests.outputs.failed-tests || 0 }},
+              "points": ${{ steps.tests.outputs.success == 'true' && 25 || 0 }}
+            },
+            "coverage": {
+              "success": ${{ steps.coverage.outputs.success }},
+              "percentage": ${{ steps.coverage.outputs.percentage || 0 }},
+              "points": ${{ steps.coverage.outputs.percentage || 0 }}
+            },
+            "mutation_testing": {
+              "success": ${{ steps.mutation.outputs.success }},
+              "score": ${{ steps.mutation.outputs.score || 0 }},
+              "points": ${{ steps.mutation.outputs.score || 0 }}
+            }
+          },
+          "summary": {
+            "quality_score": ${{ steps.analysis.outputs.quality-score }},
+            "overall_success": ${{ steps.compilation.outputs.success == 'true' && steps.tests.outputs.success == 'true' }}
+          }
+        }
+        EOF
+        
+        echo "📄 Report generated: analysis-results/quality-report.json"
+    
+    - name: Upload Analysis Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: pr-analysis-results
+        path: |
+          analysis-results/
+          target/site/jacoco/
+          target/pit-reports/
+          build/reports/jacoco/
+          build/reports/pitest/
+        retention-days: 30
+    
+    - name: Comment on PR
+      if: github.event.pull_request.number
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const qualityScore = ${{ steps.analysis.outputs.quality-score }};
+          const compilationSuccess = '${{ steps.analysis.outputs.compilation-success }}' === 'true';
+          const testSuccess = '${{ steps.analysis.outputs.test-success }}' === 'true';
+          const coveragePercentage = ${{ steps.analysis.outputs.coverage-percentage }};
+          const mutationScore = ${{ steps.analysis.outputs.mutation-score }};
+          
+          let emoji = '⚠️';
+          let status = 'Needs Attention';
+          
+          if (qualityScore >= 80) {
+            emoji = '🎉';
+            status = 'Excellent';
+          } else if (qualityScore >= 60) {
+            emoji = '👍';
+            status = 'Good';
+          }
+          
+          const recommendations = [];
+          
+          if (!compilationSuccess) {
+            recommendations.push('❌ Fix compilation errors');
+          }
+          if (!testSuccess) {
+            recommendations.push('🧪 Address failing tests');
+          }
+          if (coveragePercentage < 70) {
+            recommendations.push(`📈 Increase test coverage (currently ${coveragePercentage}%) - aim for 70%+`);
+          }
+          if (mutationScore < 60) {
+            recommendations.push(`🦠 Improve test quality through mutation testing (currently ${mutationScore}%)`);
+          }
+          
+          if (recommendations.length === 0) {
+            recommendations.push('✅ All quality metrics look good!');
+          }
+          
+          const comment = `## ${emoji} Java PR Quality Analysis - ${status}
+          
+          ### 📊 Quality Score: ${qualityScore}/100
+          
+          | Metric | Result | Score |
+          |--------|--------|-------|
+          | 🔨 Compilation | ${compilationSuccess ? '✅ Passed' : '❌ Failed'} | ${compilationSuccess ? 25 : 0}/25 |
+          | 🧪 Tests | ${testSuccess ? '✅ Passed' : '❌ Failed'} | ${testSuccess ? 25 : 0}/25 |
+          | 📈 Coverage | ${coveragePercentage}% | ${Math.floor(coveragePercentage * 25 / 100)}/25 |
+          | 🦠 Mutation Testing | ${mutationScore}% | ${Math.floor(mutationScore * 25 / 100)}/25 |
+          
+          ### 💡 Recommendations:
+          ${recommendations.map(rec => `- ${rec}`).join('\n')}
+          
+          <details>
+          <summary>📋 View Analysis Details</summary>
+          
+          - **Build System**: ${{ steps.build-system.outputs.system }}
+          - **Analysis Time**: ${new Date().toISOString()}
+          - **Commit**: ${{ github.event.pull_request.head.sha }}
+          
+          Full analysis results are available in the [workflow artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          </details>`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
 
-      - name: Compile
-        working-directory: ${{ steps.find-pom.outputs.pom_path }}
-        run: mvn -B clean compile
-
-      - name: Run Tests + Coverage
-        working-directory: ${{ steps.find-pom.outputs.pom_path }}
-        run: |
-          mvn -B test \
-            org.jacoco:jacoco-maven-plugin:prepare-agent \
-            org.jacoco:jacoco-maven-plugin:report
-
-      - name: Run Mutation Testing
-        working-directory: ${{ steps.find-pom.outputs.pom_path }}
-        run: |
-          mvn -B org.pitest:pitest-maven:mutationCoverage || true
-
-      - name: Archive Reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: java-test-reports
-          path: |
-            ${{ steps.find-pom.outputs.pom_path }}/target/surefire-reports
-            ${{ steps.find-pom.outputs.pom_path }}/target/site/jacoco
-            ${{ steps.find-pom.outputs.pom_path }}/target/pit-reports
+  # Additional job for creating check run
+  create-check:
+    name: Create Quality Check
+    runs-on: ubuntu-latest
+    needs: analyze-pr
+    if: always()
+    
+    steps:
+    - name: Create Check Run
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const qualityScore = ${{ needs.analyze-pr.outputs.quality-score }};
+          const compilationSuccess = '${{ needs.analyze-pr.outputs.compilation-success }}' === 'true';
+          const testSuccess = '${{ needs.analyze-pr.outputs.test-success }}' === 'true';
+          
+          let conclusion = 'failure';
+          let title = 'Quality check failed';
+          
+          if (compilationSuccess && testSuccess && qualityScore >= 60) {
+            conclusion = 'success';
+            title = `Quality check passed (${qualityScore}/100)`;
+          } else if (compilationSuccess && testSuccess) {
+            conclusion = 'neutral';
+            title = `Quality check completed (${qualityScore}/100)`;
+          }
+          
+          const summary = `Quality Score: ${qualityScore}/100
+          
+          - Compilation: ${compilationSuccess ? 'Passed' : 'Failed'}
+          - Tests: ${testSuccess ? 'Passed' : 'Failed'}  
+          - Coverage: ${{ needs.analyze-pr.outputs.coverage-percentage }}%
+          - Mutation Score: ${{ needs.analyze-pr.outputs.mutation-score }}%`;
+          
+          github.rest.checks.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            name: 'Java Quality Analysis',
+            head_sha: context.sha,
+            status: 'completed',
+            conclusion: conclusion,
+            output: {
+              title: title,
+              summary: summary
+            }
+          });
