@@ -895,37 +895,37 @@ jobs:
            import sqlite3
            from datetime import datetime
            
-         # Get values from environment variables
-           pr_number = os.environ.get("PR_NUMBER", "unknown")
-           repository = os.environ.get("REPOSITORY", "unknown")
-           language = os.environ.get("LANGUAGE", "unknown")
+            # Get values from environment variables
+            pr_number = os.environ.get("PR_NUMBER", "unknown")
+            repository = os.environ.get("REPOSITORY", "unknown")
+            language = os.environ.get("LANGUAGE", "unknown")
 
-         # Initialize metrics dictionary
-           metrics = {
-          "pr_number": pr_number,
-          "repository": repository,
-          "language": language,
-         "timestamp": datetime.now().isoformat(),
-         "test_metrics": {},
-         "coverage_metrics": {},
-         "mutation_metrics": {},
-         "quality_metrics": {},
-         "errors": []}
+            # Initialize metrics dictionary
+            metrics = {
+            "pr_number": pr_number,
+            "repository": repository,
+            "language": language,
+            "timestamp": datetime.now().isoformat(),
+            "test_metrics": {},
+            "coverage_metrics": {},
+            "mutation_metrics": {},
+            "quality_metrics": {},
+            "errors": []}
          
-         # Helper function to extract numeric values from text
-          def extract_number(text, default=0):
-          if not text:
+            # Helper function to extract numeric values from text
+            def extract_number(text, default=0):
+            if not text:
               return default
-          match = re.search(r'(\d+(?:\.\d+)?)', str(text))
-          return float(match.group(1)) if match else default
-         # Helper function to check if file exists
-           def file_exists(filename):
-           return os.path.isfile(filename)
+            match = re.search(r'(\d+(?:\.\d+)?)', str(text))
+            return float(match.group(1)) if match else default
+            # Helper function to check if file exists
+            def file_exists(filename):
+            return os.path.isfile(filename)
 
-         # Process Python metrics
-          if language.lower() == "python":
-         # Coverage metrics
-          if file_exists("coverage.xml"):
+            # Process Python metrics
+           if language.lower() == "python":
+           # Coverage metrics
+           if file_exists("coverage.xml"):
             try:
                 tree = ET.parse("coverage.xml")
                 root = tree.getroot()
@@ -933,8 +933,8 @@ jobs:
                 metrics["coverage_metrics"]["branch_coverage"] = float(root.attrib.get('branch-rate', 0)) * 100
             except Exception as e:
                 metrics["errors"].append(f"Error parsing coverage.xml: {str(e)}")
-          # Test metrics
-           if file_exists("pytest-report.xml"):
+            # Test metrics
+            if file_exists("pytest-report.xml"):
             try:
                 tree = ET.parse("pytest-report.xml")
                 root = tree.getroot()
@@ -966,17 +966,17 @@ jobs:
                         metrics["mutation_metrics"]["timeout_mutants"] = int(timeout_match.group(1)) if timeout_match else 0
             except Exception as e:
                 metrics["errors"].append(f"Error parsing mutation_score.txt: {str(e)}")
-         # Quality metrics
-         if file_exists("test_smells.txt"):
+           # Quality metrics
+           if file_exists("test_smells.txt"):
             try:
                 with open("test_smells.txt", "r") as f:
                     metrics["quality_metrics"]["test_smells"] = int(f.read().strip())
             except Exception as e:
                 metrics["errors"].append(f"Error reading test_smells.txt: {str(e)}")
-         # Process C++ metrics
-         elif language.lower() == "cpp":
-         # Coverage metrics
-          if file_exists("coverage.xml"):
+           # Process C++ metrics
+           elif language.lower() == "cpp":
+           # Coverage metrics
+            if file_exists("coverage.xml"):
             try:
                 tree = ET.parse("coverage.xml")
                 root = tree.getroot()
@@ -984,8 +984,8 @@ jobs:
                 metrics["coverage_metrics"]["branch_coverage"] = float(root.attrib.get('branch-rate', 0)) * 100
             except Exception as e:
                 metrics["errors"].append(f"Error parsing coverage.xml: {str(e)}")
-          # Test metrics
-           if file_exists("ctest_output.txt"):
+            # Test metrics
+             if file_exists("ctest_output.txt"):
             try:
                 with open("ctest_output.txt", "r") as f:
                     content = f.read()
@@ -1001,8 +1001,8 @@ jobs:
                         metrics["test_metrics"]["error_tests"] = 0
             except Exception as e:
                 metrics["errors"].append(f"Error parsing ctest_output.txt: {str(e)}")
-         # Mutation metrics
-          if file_exists("mutations.json"):
+           # Mutation metrics
+            if file_exists("mutations.json"):
             try:
                 with open("mutations.json", "r") as f:
                     data = json.load(f)
@@ -1017,17 +1017,17 @@ jobs:
                         metrics["mutation_metrics"]["timeout_mutants"] = 0
             except Exception as e:
                 metrics["errors"].append(f"Error parsing mutations.json: {str(e)}")
-         # Quality metrics
-          if file_exists("test_smells.txt"):
+           # Quality metrics
+            if file_exists("test_smells.txt"):
             try:
                 with open("test_smells.txt", "r") as f:
                     metrics["quality_metrics"]["test_smells"] = int(f.read().strip())
             except Exception as e:
                 metrics["errors"].append(f"Error reading test_smells.txt: {str(e)}")
-         # Process Java metrics
-          elif language.lower() == "java":
-         # Coverage metrics
-         if file_exists("target/site/jacoco/jacoco.xml"):
+           # Process Java metrics
+            elif language.lower() == "java":
+           # Coverage metrics
+           if file_exists("target/site/jacoco/jacoco.xml"):
             try:
                 tree = ET.parse("target/site/jacoco/jacoco.xml")
                 root = tree.getroot()
@@ -1037,8 +1037,8 @@ jobs:
                     metrics["coverage_metrics"]["branch_coverage"] = float(report.attrib.get('branch-rate', 0)) * 100
             except Exception as e:
                 metrics["errors"].append(f"Error parsing jacoco.xml: {str(e)}")
-          # Test metrics
-           if file_exists("target/surefire-reports"):
+            # Test metrics
+             if file_exists("target/surefire-reports"):
             try:
                 total_tests = 0
                 failed_tests = 0
@@ -1062,8 +1062,8 @@ jobs:
                 metrics["test_metrics"]["passed_tests"] = total_tests - failed_tests - skipped_tests - error_tests
             except Exception as e:
                 metrics["errors"].append(f"Error parsing surefire-reports: {str(e)}")
-         # Mutation metrics
-          if file_exists("target/pit-reports"):
+           # Mutation metrics
+            if file_exists("target/pit-reports"):
             try:
                 # Find the most recent PIT report
                 pit_reports = list(Path("target/pit-reports").glob("*/mutations.xml"))
@@ -1076,8 +1076,8 @@ jobs:
                     metrics["mutation_metrics"]["timeout_mutants"] = int(root.attrib.get('timeout', 0))
             except Exception as e:
                 metrics["errors"].append(f"Error parsing PIT reports: {str(e)}")
-         # Quality metrics
-          if file_exists("java_smells.txt"):
+           # Quality metrics
+            if file_exists("java_smells.txt"):
             try:
                 with open("java_smells.txt", "r") as f:
                     content = f.read()
@@ -1087,10 +1087,10 @@ jobs:
                         metrics["quality_metrics"]["test_smells"] = len([l for l in lines if not l.startswith('Test File')])
             except Exception as e:
                 metrics["errors"].append(f"Error reading java_smells.txt: {str(e)}")
-         # Process Kotlin metrics
-         elif language.lower() == "kotlin":
-         # Coverage metrics
-          if file_exists("build/reports/jacoco/test/jacocoTestReport.xml"):
+           # Process Kotlin metrics
+           elif language.lower() == "kotlin":
+           # Coverage metrics
+           if file_exists("build/reports/jacoco/test/jacocoTestReport.xml"):
             try:
                 tree = ET.parse("build/reports/jacoco/test/jacocoTestReport.xml")
                 root = tree.getroot()
@@ -1100,8 +1100,8 @@ jobs:
                     metrics["coverage_metrics"]["branch_coverage"] = float(report.attrib.get('branch-rate', 0)) * 100
             except Exception as e:
                 metrics["errors"].append(f"Error parsing jacocoTestReport.xml: {str(e)}")
-         # Test metrics
-           if file_exists("build/test-results/test"):
+           # Test metrics
+             if file_exists("build/test-results/test"):
             try:
                 total_tests = 0
                 failed_tests = 0
@@ -1125,8 +1125,8 @@ jobs:
                 metrics["test_metrics"]["passed_tests"] = total_tests - failed_tests - skipped_tests - error_tests
             except Exception as e:
                 metrics["errors"].append(f"Error parsing test results: {str(e)}")
-          # Mutation metrics
-           if file_exists("build/reports/pitest"):
+            # Mutation metrics
+             if file_exists("build/reports/pitest"):
             try:
                 # Find the most recent PIT report
                 pit_reports = list(Path("build/reports/pitest").glob("*/mutations.xml"))
@@ -1139,18 +1139,18 @@ jobs:
                     metrics["mutation_metrics"]["timeout_mutants"] = int(root.attrib.get('timeout', 0))
             except Exception as e:
                 metrics["errors"].append(f"Error parsing PIT reports: {str(e)}")
-         # Process Go metrics
-         elif language.lower() == "go":
-         # Coverage metrics
-          if file_exists("coverage.xml"):
+           # Process Go metrics
+           elif language.lower() == "go":
+           # Coverage metrics
+            if file_exists("coverage.xml"):
             try:
                 tree = ET.parse("coverage.xml")
                 root = tree.getroot()
                 metrics["coverage_metrics"]["line_coverage"] = float(root.attrib.get('line-rate', 0)) * 100
             except Exception as e:
                 metrics["errors"].append(f"Error parsing coverage.xml: {str(e)}")
-         # Test metrics
-           if file_exists("test_output.txt"):
+           # Test metrics
+             if file_exists("test_output.txt"):
             try:
                 with open("test_output.txt", "r") as f:
                     content = f.read()
@@ -1176,8 +1176,8 @@ jobs:
                         metrics["test_metrics"]["error_tests"] = 0
             except Exception as e:
                 metrics["errors"].append(f"Error parsing test_output.txt: {str(e)}")
-         # Mutation metrics
-           if file_exists("go_mutation.txt"):
+           # Mutation metrics
+             if file_exists("go_mutation.txt"):
             try:
                 with open("go_mutation.txt", "r") as f:
                     content = f.read()
@@ -1187,20 +1187,20 @@ jobs:
                         metrics["mutation_metrics"]["mutation_score"] = float(score_match.group(1))
             except Exception as e:
                 metrics["errors"].append(f"Error parsing go_mutation.txt: {str(e)}")
-         # Write metrics to JSON file
-         with open("metrics.json", "w") as f:
-         json.dump(metrics, f, indent=2)
-         # Generate summary markdown
-         with open("metrics_summary.md", "w") as f:
-         f.write("# Test Metrics Summary\n\n")
-         f.write(f"**Repository:** {metrics['repository']}\n")
-         f.write(f"**PR Number:** {metrics['pr_number']}\n")
-         f.write(f"**Language:** {metrics['language'].upper()}\n")
-         f.write(f"**Timestamp:** {metrics['timestamp']}\n\n")
+           # Write metrics to JSON file
+           with open("metrics.json", "w") as f:
+           json.dump(metrics, f, indent=2)
+           # Generate summary markdown
+           with open("metrics_summary.md", "w") as f:
+           f.write("# Test Metrics Summary\n\n")
+           f.write(f"**Repository:** {metrics['repository']}\n")
+           f.write(f"**PR Number:** {metrics['pr_number']}\n")
+           f.write(f"**Language:** {metrics['language'].upper()}\n")
+           f.write(f"**Timestamp:** {metrics['timestamp']}\n\n")
 
-         # Test metrics section
-         f.write("## Test Metrics\n\n")
-         if metrics["test_metrics"]:
+           # Test metrics section
+           f.write("## Test Metrics\n\n")
+           if metrics["test_metrics"]:
             total = metrics["test_metrics"].get("total_tests", 0)
             passed = metrics["test_metrics"].get("passed_tests", 0)
             failed = metrics["test_metrics"].get("failed_tests", 0)
@@ -1212,23 +1212,23 @@ jobs:
             f.write(f"- **Failed:** {failed} ({(failed/total*100) if total > 0 else 0:.1f}%)\n")
             f.write(f"- **Skipped:** {skipped} ({(skipped/total*100) if total > 0 else 0:.1f}%)\n")
             f.write(f"- **Errors:** {errors} ({(errors/total*100) if total > 0 else 0:.1f}%)\n")
-         else:
+           else:
             f.write("No test metrics available\n")
-         f.write("\n")
-         # Coverage metrics section
-         f.write("## Coverage Metrics\n\n")
-         if metrics["coverage_metrics"]:
+           f.write("\n")
+           # Coverage metrics section
+           f.write("## Coverage Metrics\n\n")
+           if metrics["coverage_metrics"]:
             line_coverage = metrics["coverage_metrics"].get("line_coverage", 0)
             branch_coverage = metrics["coverage_metrics"].get("branch_coverage", 0)
             
             f.write(f"- **Line Coverage:** {line_coverage:.2f}%\n")
             f.write(f"- **Branch Coverage:** {branch_coverage:.2f}%\n")
-         else:
+           else:
             f.write("No coverage metrics available\n")
-         f.write("\n") 
-         # Mutation metrics section
-         f.write("## Mutation Testing Metrics\n\n")
-         if metrics["mutation_metrics"]:
+           f.write("\n") 
+           # Mutation metrics section
+           f.write("## Mutation Testing Metrics\n\n")
+           if metrics["mutation_metrics"]:
             mutation_score = metrics["mutation_metrics"].get("mutation_score", 0)
             killed = metrics["mutation_metrics"].get("killed_mutants", 0)
             survived = metrics["mutation_metrics"].get("survived_mutants", 0)
@@ -1239,66 +1239,66 @@ jobs:
             f.write(f"- **Killed Mutants:** {killed} ({(killed/total*100) if total > 0 else 0:.1f}%)\n")
             f.write(f"- **Survived Mutants:** {survived} ({(survived/total*100) if total > 0 else 0:.1f}%)\n")
             f.write(f"- **Timeout Mutants:** {timeout} ({(timeout/total*100) if total > 0 else 0:.1f}%)\n")
-         else:
+           else:
             f.write("No mutation testing metrics available\n")
-         f.write("\n")
-         # Quality metrics section
-         f.write("## Quality Metrics\n\n")
-         if metrics["quality_metrics"]:
+           f.write("\n")
+           # Quality metrics section
+           f.write("## Quality Metrics\n\n")
+           if metrics["quality_metrics"]:
             test_smells = metrics["quality_metrics"].get("test_smells", 0)
             f.write(f"- **Test Smells:** {test_smells}\n")
-         else:
+           else:
             f.write("No quality metrics available\n")
-         f.write("\n")
-         # Errors section
-         if metrics["errors"]:
+           f.write("\n")
+           # Errors section
+           if metrics["errors"]:
             f.write("## Errors\n\n")
             for error in metrics["errors"]:
                 f.write(f"- {error}\n")
             f.write("\n")
-         # Overall assessment
-         f.write("## Overall Assessment\n\n")
-         # Calculate overall score
-         test_score = 0
-         coverage_score = 0
-         mutation_score = 0
-         quality_score = 100
-         if metrics["test_metrics"]:
+           # Overall assessment
+           f.write("## Overall Assessment\n\n")
+           # Calculate overall score
+           test_score = 0
+           coverage_score = 0
+           mutation_score = 0
+           quality_score = 100
+           if metrics["test_metrics"]:
             total = metrics["test_metrics"].get("total_tests", 0)
             passed = metrics["test_metrics"].get("passed_tests", 0)
             test_score = (passed / total * 100) if total > 0 else 0
-         if metrics["coverage_metrics"]:
+           if metrics["coverage_metrics"]:
             line_coverage = metrics["coverage_metrics"].get("line_coverage", 0)
             branch_coverage = metrics["coverage_metrics"].get("branch_coverage", 0)
             coverage_score = (line_coverage + branch_coverage) / 2
-         if metrics["mutation_metrics"]:
+           if metrics["mutation_metrics"]:
             mutation_score = metrics["mutation_metrics"].get("mutation_score", 0)
-         if metrics["quality_metrics"]:
+           if metrics["quality_metrics"]:
             test_smells = metrics["quality_metrics"].get("test_smells", 0)
             # Reduce quality score based on number of test smells
             quality_score = max(0, 100 - test_smells * 2)
-         # Calculate overall score
-          overall_score = (test_score * 0.3 + coverage_score * 0.3 + mutation_score * 0.3 + quality_score * 0.1)
-         f.write(f"**Overall Score:** {overall_score:.1f}/100\n\n")
-         f.write("| Metric | Weight | Score | Weighted Score |\n")
-         f.write("|--------|--------|-------|----------------|\n")
-         f.write(f"| Tests | 30% | {test_score:.1f} | {test_score * 0.3:.1f} |\n")
-         f.write(f"| Coverage | 30% | {coverage_score:.1f} | {coverage_score * 0.3:.1f} |\n")
-         f.write(f"| Mutation | 30% | {mutation_score:.1f} | {mutation_score * 0.3:.1f} |\n")
-         f.write(f"| Quality | 10% | {quality_score:.1f} | {quality_score * 0.1:.1f} |\n")
-         f.write(f"| **Overall** | **100%** | | **{overall_score:.1f}** |\n")
-         # Add assessment based on overall score
-         f.write("\n### Assessment\n\n")
-         if overall_score >= 90:
+           # Calculate overall score
+            overall_score = (test_score * 0.3 + coverage_score * 0.3 + mutation_score * 0.3 + quality_score * 0.1)
+           f.write(f"**Overall Score:** {overall_score:.1f}/100\n\n")
+           f.write("| Metric | Weight | Score | Weighted Score |\n")
+           f.write("|--------|--------|-------|----------------|\n")
+           f.write(f"| Tests | 30% | {test_score:.1f} | {test_score * 0.3:.1f} |\n")
+           f.write(f"| Coverage | 30% | {coverage_score:.1f} | {coverage_score * 0.3:.1f} |\n")
+           f.write(f"| Mutation | 30% | {mutation_score:.1f} | {mutation_score * 0.3:.1f} |\n")
+           f.write(f"| Quality | 10% | {quality_score:.1f} | {quality_score * 0.1:.1f} |\n")
+           f.write(f"| **Overall** | **100%** | | **{overall_score:.1f}** |\n")
+           # Add assessment based on overall score
+           f.write("\n### Assessment\n\n")
+           if overall_score >= 90:
             f.write("🟢 **Excellent**: The code has outstanding test quality, coverage, and mutation resistance.\n")
-         elif overall_score >= 80:
+           elif overall_score >= 80:
             f.write("🟡 **Good**: The code has solid test quality, but there are areas for improvement.\n")
-         elif overall_score >= 70:
+           elif overall_score >= 70:
             f.write("🟠 **Fair**: The code has adequate testing, but significant improvements are needed.\n")
-         else:
+           else:
             f.write("🔴 **Poor**: The code lacks sufficient testing and quality measures. Immediate attention required.\n")
-         print("Metrics summary generated successfully")
-         EOF
+           print("Metrics summary generated successfully")
+           EOF
 
       - name: Upload consolidated metrics
         if: always()
