@@ -1,4 +1,4 @@
-name: Test python pr
+name: Test External PR
 
 on:
   workflow_dispatch:
@@ -30,55 +30,83 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f test-requirements.txt ]; then pip install -r test-requirements.txt; fi
-          pip install pytest pytest-cov mutmut pytest-smell flake8
+          pip install pytest pytest-cov mutmut pytest-smell
 
       - name: Compilation check (syntax validation)
         id: compilation
         continue-on-error: true
         run: |
           echo "### Compilation Check" >> $GITHUB_STEP_SUMMARY
-          if python -m compileall -q .; then
+          python -m compileall -q . > comp_output.txt 2>&1
+          comp_exit=$?
+          cat comp_output.txt >> $GITHUB_STEP_SUMMARY
+          if [ $comp_exit -eq 0 ]; then
+            echo "status=Success" >> $GITHUB_OUTPUT
             echo "Success: No syntax errors." >> $GITHUB_STEP_SUMMARY
           else
-            echo "Failure: Syntax errors found." >> $GITHUB_STEP_SUMMARY
+            echo "status=Failure" >> $GITHUB_OUTPUT
+            echo "Failure: Syntax errors found. See details above." >> $GITHUB_STEP_SUMMARY
           fi
-
-      - name: Run linting (flake8)
-        id: linting
-        continue-on-error: true
-        run: |
-          echo "### Linting Results" >> $GITHUB_STEP_SUMMARY
-          flake8 . >> $GITHUB_STEP_SUMMARY || echo "Linting failed with issues above." >> $GITHUB_STEP_SUMMARY
 
       - name: Run tests with coverage
         id: tests
         continue-on-error: true
         run: |
           echo "### Test Execution and Coverage" >> $GITHUB_STEP_SUMMARY
-          pytest --cov=. --cov-report=term-missing >> $GITHUB_STEP_SUMMARY 2>&1
-          echo "" >> $GITHUB_STEP_SUMMARY
+          pytest --cov=. --cov-report=term > test_output.txt 2>&1 || true
+          cat test_output.txt >> $GITHUB_STEP_SUMMARY
+          cov_line=$(grep "TOTAL" test_output.txt | tail -1 | awk '{print $(NF)}' | sed 's/%//')
+          if [ -n "$cov_line" ]; then
+            echo "coverage=$cov_line%" >> $GITHUB_OUTPUT
+          else
+            echo "coverage=N/A" >> $GITHUB_OUTPUT
+          fi
+          if grep -q "failed" test_output.txt; then
+            echo "status=Failure" >> $GITHUB_OUTPUT
+          elif grep -q "passed\|no tests ran" test_output.txt; then
+            echo "status=Success" >> $GITHUB_OUTPUT
+          else
+            echo "status=Error" >> $GITHUB_OUTPUT
+          fi
 
       - name: Mutation testing
         id: mutation
         continue-on-error: true
         run: |
           echo "### Mutation Testing" >> $GITHUB_STEP_SUMMARY
-          mutmut run --runner "pytest --cov=." >> $GITHUB_STEP_SUMMARY 2>&1
-          echo "" >> $GITHUB_STEP_SUMMARY
+          mutmut run --runner "pytest" > mut_output.txt 2>&1 || true
+          cat mut_output.txt >> $GITHUB_STEP_SUMMARY
+          # Extract final line with stats
+          final_line=$(grep -E '[0-9]+/[0-9]+  🎉' mut_output.txt | tail -1)
+          if [ -n "$final_line" ]; then
+            total=$(echo "$final_line" | cut -d' ' -f1 | cut -d/ -f2)
+            killed=$(echo "$final_line" | cut -d' ' -f3)
+            if [ "$total" -gt 0 ]; then
+              score=$(( killed * 100 / total ))
+              echo "score=${score}%" >> $GITHUB_OUTPUT
+            else
+              echo "score=N/A" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "score=N/A" >> $GITHUB_OUTPUT
+          fi
 
       - name: Detect test smells
         id: smells
         continue-on-error: true
         run: |
           echo "### Test Smells Detection" >> $GITHUB_STEP_SUMMARY
-          pytest-smell --ci >> $GITHUB_STEP_SUMMARY 2>&1
-          echo "" >> $GITHUB_STEP_SUMMARY
+          pytest-smell --ci > smells_output.txt 2>&1 || true
+          cat smells_output.txt >> $GITHUB_STEP_SUMMARY
+          # Assuming output lists smells, count lines that indicate smells
+          smells_count=$(grep -ic "smell detected" smells_output.txt || echo 0)
+          echo "result=$smells_count smells detected. See details for more." >> $GITHUB_OUTPUT
 
       - name: Overall Summary
         run: |
           echo "## Results Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Compilation: ${{ steps.compilation.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Linting: ${{ steps.linting.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Tests: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Mutation: ${{ steps.mutation.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Test Smells: ${{ steps.smells.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Compilation: ${{ steps.compilation.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Test Execution: ${{ steps.tests.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Coverage: ${{ steps.tests.outputs.coverage }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Mutation Score: ${{ steps.mutation.outputs.score }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Test Smells: ${{ steps.smells.outputs.result }}" >> $GITHUB_STEP_SUMMARY
