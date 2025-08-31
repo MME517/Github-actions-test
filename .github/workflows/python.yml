@@ -34,10 +34,8 @@ jobs:
           # Install project dependencies if files exist
           if [ -f requirements.txt ]; then pip install -r requirements.txt || echo "Failed to install requirements.txt" >> $GITHUB_STEP_SUMMARY; fi
           if [ -f test-requirements.txt ]; then pip install -r test-requirements.txt || echo "Failed to install test-requirements.txt" >> $GITHUB_STEP_SUMMARY; fi
-          # Install testing tools
-          pip install pytest pytest-cov mutmut || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
-          # Note: Assuming test-smell-detector is unavailable; using pytest for smell detection
-          pip install flake8
+          # Install testing tools with error handling
+          pip install pytest pytest-cov mutmut flake8 || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
 
       # Check for syntax errors in Python code
       - name: Compilation check (syntax validation)
@@ -65,8 +63,8 @@ jobs:
         timeout-minutes: 10
         run: |
           echo "### Test Execution and Coverage" >> $GITHUB_STEP_SUMMARY
-          # Run pytest with coverage and capture output
-          pytest --cov=. --cov-report=term > test_output.txt 2>&1 || true
+          # Run pytest with coverage, disabling dynamic_context to avoid warnings
+          pytest --cov=. --cov-report=term --cov-context=none > test_output.txt 2>&1 || true
           cat test_output.txt >> $GITHUB_STEP_SUMMARY
           # Extract coverage percentage
           cov_line=$(grep "TOTAL" test_output.txt | tail -1 | awk '{print $(NF)}' | sed 's/%//')
@@ -95,8 +93,10 @@ jobs:
         timeout-minutes: 15
         run: |
           echo "### Mutation Testing" >> $GITHUB_STEP_SUMMARY
-          # Run mutmut with pytest as the test runner
-          mutmut run --runner "pytest" > mut_output.txt 2>&1 || true
+          # Create a temporary mutmut configuration to specify pytest as the test runner
+          echo "def run_tests(): import os; os.system('pytest')" > mutmut_config.py
+          # Run mutmut, targeting Python files in the current directory
+          mutmut run --paths-to-mutate . --test-time-multiplier 2.0 > mut_output.txt 2>&1 || true
           cat mut_output.txt >> $GITHUB_STEP_SUMMARY
           # Extract mutation score (e.g., "10/12  🎉" means 10 killed out of 12 mutants)
           final_line=$(grep -E '[0-9]+/[0-9]+.*🎉' mut_output.txt | tail -1)
@@ -115,7 +115,7 @@ jobs:
             echo "Mutation testing failed or no mutants generated." >> $GITHUB_STEP_SUMMARY
           fi
 
-      # Detect test smells using flake8 for code quality (as pytest-smell is not standard)
+      # Detect test smells using flake8 on test files
       - name: Detect test smells
         id: smells
         continue-on-error: true
