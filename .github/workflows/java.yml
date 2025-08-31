@@ -75,7 +75,7 @@ jobs:
                             </configuration>
                         </plugin>
                     </plugins>
-                </build>
+                </-Dimensional>
             </project>' > pom.xml
           fi
 
@@ -88,8 +88,10 @@ jobs:
           echo "::endgroup::"
           if [[ "${{ steps.compile.outcome }}" == "success" ]]; then
             echo "Compilation: Success"
+            echo "COMPILE_STATUS=Success" >> $GITHUB_ENV
           else
             echo "Compilation: Failed"
+            echo "COMPILE_STATUS=Failed" >> $GITHUB_ENV
           fi
 
       - name: Run tests with coverage
@@ -106,8 +108,10 @@ jobs:
           echo "::endgroup::"
           if [[ "${{ steps.test.outcome }}" == "success" ]]; then
             echo "Test Execution: Success"
+            echo "TEST_STATUS=Success" >> $GITHUB_ENV
           else
             echo "Test Execution: Failed"
+            echo "TEST_STATUS=Failed" >> $GITHUB_ENV
           fi
 
       - name: Generate coverage report
@@ -147,9 +151,9 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::Test Smells Detection"
-          # Placeholder: Replace with actual test smells tool (e.g., tsDetect CLI)
+          # Placeholder: Replace with a CLI-based test smells tool
           echo "Test Smells: N/A (Using placeholder; replace with actual tool)"
-          # Example: Hypothetical tsDetect CLI
+          # Example: Hypothetical tsDetect CLI (replace with real tool)
           # curl -L https://example.com/tsdetect-cli.jar -o tsdetect.jar
           # java -jar tsdetect.jar src/test/java --output output.csv || echo "Test smells detection failed"
           echo "No test smells data" > test-smells-report.txt
@@ -174,17 +178,18 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const compileStatus = "${{ steps.compile.outcome }}" === "success" ? "Success" : "Failed";
-            const testStatus = "${{ steps.test.outcome }}" === "success" ? "Success" : "Failed";
+            const repoParts = "${{ inputs.repo }}".split('/');
+            const owner = repoParts[0];
+            const repo = repoParts[1];
             const summary = `**PR Analysis Summary**\n` +
-                            `- Compilation: ${compileStatus}\n` +
-                            `- Test Execution: ${testStatus}\n` +
+                            `- Compilation: ${process.env.COMPILE_STATUS || 'N/A'}\n` +
+                            `- Test Execution: ${process.env.TEST_STATUS || 'N/A'}\n` +
                             `- Code Coverage: ${process.env.COVERAGE || 'N/A'}\n` +
                             `- Mutation Score: ${process.env.MUTATION_SCORE || 'N/A'}\n` +
                             `- Test Smells: ${process.env.SMELLS_COUNT || 'N/A'}`;
             github.rest.issues.createComment({
-              owner: '${{ inputs.repo.split('/')[0] }}',
-              repo: '${{ inputs.repo.split('/')[1] }}',
+              owner: owner,
+              repo: repo,
               issue_number: ${{ inputs.pr }},
               body: summary
             });
