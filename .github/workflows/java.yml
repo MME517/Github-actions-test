@@ -33,27 +33,13 @@ jobs:
           mv lib/jacocoagent.jar .
           mv lib/jacococli.jar .
 
-      - name: Download PITest jars
-        run: |
-          curl -L https://repo1.maven.org/maven2/org/pitest/pitest/1.20.2/pitest-1.20.2.jar -o pitest.jar
-          curl -L https://repo1.maven.org/maven2/org/pitest/pitest-command-line/1.20.2/pitest-command-line-1.20.2.jar -o pitest-command-line.jar
-          curl -L https://repo1.maven.org/maven2/org/pitest/pitest-junit5-plugin/1.2.1/pitest-junit5-plugin-1.2.1.jar -o pitest-junit5-plugin.jar
-
-      - name: Build test smells detector
-        run: |
-          git clone https://github.com/TestSmells/TSDetect.git tsdetect
-          cd tsdetect
-          ./gradlew jar  # Assuming it has a jar task; adjust if needed (e.g., shadowJar)
-          cd ..
-          cp tsdetect/build/libs/*.jar TestSmellDetector.jar  # Assuming the output jar
-
       - name: Compilation check
         id: compile
         continue-on-error: true
-        run: mvn compile
-
-      - name: Echo compilation result
         run: |
+          echo "::group::Compilation Output"
+          mvn compile || echo "Compilation failed"
+          echo "::endgroup::"
           if [ ${{ steps.compile.outcome }} == 'success' ]; then
             echo "Compilation: Success"
           else
@@ -63,10 +49,10 @@ jobs:
       - name: Run tests with coverage
         id: test
         continue-on-error: true
-        run: mvn -DargLine="-javaagent:$(pwd)/jacocoagent.jar=destfile=jacoco.exec" test
-
-      - name: Echo test execution result
         run: |
+          echo "::group::Test Output"
+          mvn -DargLine="-javaagent:$(pwd)/jacocoagent.jar=destfile=jacoco.exec" test || echo "Tests failed"
+          echo "::endgroup::"
           if [ ${{ steps.test.outcome }} == 'success' ]; then
             echo "Test Execution: Success"
           else
@@ -75,73 +61,64 @@ jobs:
 
       - name: Generate coverage report
         if: always()
-        run: java -jar jacococli.jar report jacoco.exec --classfiles target/classes --sourcefiles src/main/java --html coverage-report
-
-      - name: Get coverage summary
-        if: always()
         run: |
-          # Simple parse of index.html for total coverage
-          if [ -f coverage-report/index.html ]; then
+          if [ -f jacoco.exec ]; then
+            java -jar jacococli.jar report jacoco.exec --classfiles target/classes --sourcefiles src/main/java --html coverage-report
             coverage=$(grep -oP '(?<=Total</td><td class="ctr2">)\d+%' coverage-report/index.html || echo "N/A")
             echo "Code Coverage: $coverage"
           else
-            echo "Code Coverage: N/A"
+            echo "Code Coverage: N/A (jacoco.exec not found)"
+            mkdir -p coverage-report
+            echo "No coverage data" > coverage-report/index.html
           fi
 
-      - name: Prepare for mutation testing
+      - name: Run mutation testing with Maven PITest
         if: always()
+        continue-on-error: true
         run: |
-          mvn dependency:build-classpath -Dmdep.includeScope=test -Dmdep.outputFile=cp.txt || true
-          if [ -f cp.txt ]; then
-            CP=$(cat cp.txt)
-            FULL_CP="target/classes:target/test-classes:$CP"
-            CLASSES=$(find target/classes -name '*.class' 2>/dev/null | sed 's|target/classes/||; s|/|.|g; s|\.class$||' | paste -sd ',' - || echo '*')
-            TESTS=$(find target/test-classes -name '*.class' 2>/dev/null | sed 's|target/test-classes/||; s|/|.|g; s|\.class$||' | paste -sd ',' - || echo '*')
-            echo "FULL_CP=$FULL_CP" >> $GITHUB_ENV
-            echo "CLASSES=$CLASSES" >> $GITHUB_ENV
-            echo "TESTS=$TESTS" >> $GITHUB_ENV
-          else
-            echo "FULL_CP=" >> $GITHUB_ENV
-            echo "CLASSES=*" >> $GITHUB_ENV
-            echo "TESTS=*" >> $GITHUB_ENV
-          fi
-
-      - name: Run mutation testing
-        if: always()
-        run: |
-          if [ -n "${{ env.FULL_CP }}" ]; then
-            java -cp pitest.jar:pitest-command-line.jar:pitest-junit5-plugin.jar:${{ env.FULL_CP }} org.pitest.mutationtest.commandline.MutationCoverageReport \
-              --reportDir mutation-report \
-              --targetClasses ${{ env.CLASSES }} \
-              --targetTests ${{ env.TESTS }} \
-              --sourceDirs src/main/java,src/test/java || true
-          else
-            echo "Skipping mutation testing due to classpath issues"
-          fi
-
-      - name: Get mutation summary
-        if: always()
-        run: |
+          echo "::group::Mutation Testing Output"
+          mvn org.pitest:pitest-maven:mutationCoverage \
+            -DoutputFormats=HTML \
+            -DreportsDirectory=mutation-report \
+            -DtargetClasses='*' \
+            -DtargetTests='*' || echo "Mutation testing failed"
+          echo "::endgroup::"
           if [ -f mutation-report/index.html ]; then
             mutation_score=$(grep -oP '(?<=Mutation score</td><td>)\d+%' mutation-report/index.html || echo "N/A")
             echo "Mutation Score: $mutation_score"
           else
             echo "Mutation Score: N/A"
+            mkdir -p mutation-report
+            echo "No mutation data" > mutation-report/index.html
           fi
 
-      - name: Run test smells detection
+      - name: Download and run test smells detector
         if: always()
-        run: java -jar TestSmellDetector.jar src/test/java || true
+        continue-on-error: true
+        run: |
+          echo "::group::Test Smells Detection"
+          git clone https://github.com/TestSmells/TSDetect.git tsdetect
+          cd tsdetect
+          ./gradlew jar || echo "Failed to build TSDetect"
+          cd ..
+          if [ -f tsdetect/build/libs/*.jar ]; then
+            cp tsdetect/build/libs/*.jar TestSmellDetector.jar
+            java -jar TestSmellDetector.jar src/test/java || echo "Test smells detection failed"
+          else
+            echo "Test Smells: N/A (detector jar not found)"
+          fi
+          echo "::endgroup::"
 
       - name: Get test smells summary
         if: always()
         run: |
-          if [ -f output.csv ]; then  # Assuming output is output.csv
+          if [ -f output.csv ]; then
             smells_count=$(tail -n +2 output.csv | grep -o 'true' | wc -l || echo 0)
             echo "Detected Test Smells: $smells_count"
             cat output.csv
           else
-            echo "Test Smells: N/A"
+            echo "Test Smells: N/A (output.csv not found)"
+            echo "No test smells data" > test-smells-report.txt
           fi
 
       - name: Upload reports
@@ -150,7 +127,8 @@ jobs:
         with:
           name: analysis-reports
           path: |
-            coverage-report
-            mutation-report
+            coverage-report/
+            mutation-report/
             *.csv
             jacoco.exec
+            test-smells-report.txt
