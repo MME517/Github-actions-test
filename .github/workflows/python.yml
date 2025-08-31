@@ -38,8 +38,8 @@ jobs:
               pip install -r "$req_file" || echo "Failed to install $req_file" >> $GITHUB_STEP_SUMMARY
             fi
           done
-          # Install testing tools
-          pip install pytest pytest-cov==4.1.0 mutatest flake8 pytest-asyncio || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
+          # Install testing tools and setuptools
+          pip install pytest pytest-cov==4.1.0 --upgrade coverage mutatest setuptools flake8 pytest-asyncio || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
 
       # Create a .coveragerc file to exclude non-Python files and directories
       - name: Configure coverage
@@ -89,7 +89,7 @@ jobs:
           # Run pytest with coverage, disabling warnings to reduce overhead
           pytest --cov=. --cov-report=term --cov-config=.coveragerc --disable-pytest-warnings > test_output.txt 2>&1 || true
           cat test_output.txt >> $GITHUB_STEP_SUMMARY
-          # Extract coverage percentage
+          # Extract coverage percentage (e.g., "TOTAL" line)
           cov_line=$(grep "TOTAL" test_output.txt | tail -1 | awk '{print $(NF)}' | sed 's/%//')
           if [ -n "$cov_line" ] && [[ "$cov_line" =~ ^[0-9]+$ ]]; then
             echo "coverage=$cov_line%" >> $GITHUB_OUTPUT
