@@ -388,14 +388,14 @@ except:
         # Create detailed report
         cat > analysis_report.md << 'EOL'
 # 🔍 Python PR Analysis Report
-        
+
 ## 📋 PR Information
 - **Repository:** ${{ env.REPO_NAME }}
 - **PR Number:** #${{ env.PR_NUMBER }}
 - **Commit SHA:** ${{ steps.pr_info.outputs.head_sha }}
 - **Python Version:** ${{ env.PYTHON_VERSION }}
 - **Analysis Date:** $(date)
-        
+
 ## ⚡ Quick Summary
 | Metric | Result | Status |
 |--------|---------|--------|
@@ -404,53 +404,53 @@ except:
 | Coverage | ${{ steps.tests.outputs.coverage_percentage }}% | ${{ steps.tests.outputs.coverage_percentage >= 80 && 'GOOD' || steps.tests.outputs.coverage_percentage >= 60 && 'FAIR' || 'POOR' }} |
 | Mutation Score | ${{ steps.mutation.outputs.mutation_score }}% | ${{ steps.mutation.outputs.mutation_score >= 75 && 'EXCELLENT' || steps.mutation.outputs.mutation_score >= 50 && 'GOOD' || 'NEEDS_WORK' }} |
 | Test Smells | ${{ steps.test_smells.outputs.smell_count }} issues | ${{ steps.test_smells.outputs.smell_count == 0 && 'CLEAN' || steps.test_smells.outputs.smell_count <= 5 && 'ACCEPTABLE' || 'NEEDS_ATTENTION' }} |
-        
+
 ## 🔧 Project Structure
 - **Test Framework:** ${{ steps.project_info.outputs.test_framework }}
 - **Dependencies:** ${{ steps.project_info.outputs.has_requirements == 'true' && 'requirements.txt ' || '' }}${{ steps.project_info.outputs.has_setup_py == 'true' && 'setup.py ' || '' }}${{ steps.project_info.outputs.has_pyproject == 'true' && 'pyproject.toml ' || '' }}
-        
+
 ## 🧪 Test Results
-        
+
 ### Execution Status
 ${{ steps.tests.outputs.test_success == 'true' && '✅ All tests passed successfully' || '❌ Some tests failed' }}
-        
+
 ### Coverage Analysis
 - **Line Coverage:** ${{ steps.tests.outputs.coverage_percentage }}%
 - **Coverage Goal:** 80%+ (Recommended)
-        
+
 ${{ steps.tests.outputs.coverage_percentage >= 80 && '🎯 Excellent coverage! Your tests cover most of the codebase.' || steps.tests.outputs.coverage_percentage >= 60 && '🔶 Fair coverage. Consider adding more tests for better protection.' || '🔻 Low coverage. Significant portions of code are untested.' }}
-        
+
 ## 🧬 Mutation Testing
-        
+
 - **Mutation Score:** ${{ steps.mutation.outputs.mutation_score }}%
 - **Quality Assessment:** ${{ steps.mutation.outputs.mutation_score >= 75 && '🏆 Excellent - Your tests catch most bugs!' || steps.mutation.outputs.mutation_score >= 50 && '👍 Good - Tests are reasonably effective' || '⚠️ Poor - Tests may miss many bugs' }}
-        
+
 ## 👃 Test Smell Analysis
-        
+
 ${{ steps.test_smells.outputs.test_smells }}
-        
+
 **Total Issues Found:** ${{ steps.test_smells.outputs.smell_count }}
-        
+
 ## 📏 Code Quality Metrics
-        
+
 - **Pylint Score:** ${{ steps.quality.outputs.pylint_score }}/10
 - **Flake8 Issues:** ${{ steps.quality.outputs.flake8_issues }}
 - **Complexity:** ${{ steps.quality.outputs.complexity_score }}
-        
+
 ## 🚨 Compilation Issues
-        
+
 ${{ steps.compilation.outputs.compilation_success == 'true' && '✅ No compilation errors found' || steps.compilation.outputs.syntax_errors }}
-        
+
 ## 📝 Recommendations
-        
+
 ${{ steps.tests.outputs.coverage_percentage < 80 && '- 📈 **Increase test coverage**: Aim for 80%+ coverage by adding tests for uncovered code paths' || '' }}
 ${{ steps.mutation.outputs.mutation_score < 60 && '- 🧬 **Improve test quality**: Current mutation score suggests tests might not catch all bugs' || '' }}
 ${{ steps.test_smells.outputs.smell_count > 5 && '- 👃 **Address test smells**: Refactor tests to improve maintainability and readability' || '' }}
 ${{ steps.quality.outputs.flake8_issues > 0 && '- 🔧 **Fix code style issues**: Address flake8 violations for better code consistency' || '' }}
 ${{ steps.compilation.outputs.compilation_success == 'false' && '- 🚨 **Fix compilation errors**: Resolve syntax errors before proceeding' || '' }}
-        
+
 ## 🎯 Overall Assessment
-        
+
 EOL
         
         # Calculate overall score
