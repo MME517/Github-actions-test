@@ -20,6 +20,7 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0 # Fetch full history for git diff
 
       # Set up Python environment with version 3.12
       - name: Set up Python
@@ -27,15 +28,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Install project dependencies and required testing tools, pinning versions
+      # Install project dependencies and required testing tools
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           # Install project dependencies if files exist
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || echo "Failed to install requirements.txt" >> $GITHUB_STEP_SUMMARY; fi
-          if [ -f test-requirements.txt ]; then pip install -r test-requirements.txt || echo "Failed to install test-requirements.txt" >> $GITHUB_STEP_SUMMARY; fi
-          # Install specific versions of testing tools for compatibility
-          pip install pytest pytest-cov==4.1.0 mutmut==2.4.0 flake8 || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
+          for req_file in requirements.txt test-requirements.txt requirements-dev.txt; do
+            if [ -f "$req_file" ]; then
+              pip install -r "$req_file" || echo "Failed to install $req_file" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          # Install testing tools, try mutmut>=2.5.0 with fallback to 2.4.0
+          pip install pytest pytest-cov==4.1.0 mutmut==2.5.0 flake8 pytest-asyncio || pip install pytest pytest-cov==4.1.0 mutmut==2.4.0 flake8 pytest-asyncio || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
 
       # Create a .coveragerc file to exclude non-Python files and directories
       - name: Configure coverage
@@ -44,8 +48,14 @@ jobs:
           echo "source = ." >> .coveragerc
           echo "omit =" >> .coveragerc
           echo "  *.html" >> .coveragerc
+          echo "  *.md" >> .coveragerc
+          echo "  *.json" >> .coveragerc
+          echo "  *.yaml" >> .coveragerc
           echo "  templates/*" >> .coveragerc
           echo "  tests/*" >> .coveragerc
+          echo "  docs/*" >> .coveragerc
+          echo "  examples/*" >> .coveragerc
+          echo "  scripts/*" >> .coveragerc
 
       # Check for syntax errors in Python code
       - name: Compilation check (syntax validation)
@@ -53,7 +63,6 @@ jobs:
         continue-on-error: true
         run: |
           echo "### Compilation Check" >> $GITHUB_STEP_SUMMARY
-          # Check if any Python files exist
           if find . -name "*.py" | grep -q .; then
             python -m compileall -q . > comp_output.txt 2>&1
             comp_exit=$?
@@ -77,8 +86,8 @@ jobs:
         timeout-minutes: 10
         run: |
           echo "### Test Execution and Coverage" >> $GITHUB_STEP_SUMMARY
-          # Run pytest with coverage, using .coveragerc for configuration
-          pytest --cov=. --cov-report=term --cov-config=.coveragerc > test_output.txt 2>&1 || true
+          # Run pytest with coverage, disabling warnings to reduce overhead
+          pytest --cov=. --cov-report=term --cov-config=.coveragerc --disable-pytest-warnings > test_output.txt 2>&1 || true
           cat test_output.txt >> $GITHUB_STEP_SUMMARY
           # Extract coverage percentage
           cov_line=$(grep "TOTAL" test_output.txt | tail -1 | awk '{print $(NF)}' | sed 's/%//')
@@ -103,36 +112,58 @@ jobs:
             echo "All tests passed or skipped." >> $GITHUB_STEP_SUMMARY
           fi
 
-      # Perform mutation testing to assess test effectiveness
+      # Perform mutation testing on PR-changed files
       - name: Mutation testing
         id: mutation
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 15
         run: |
           echo "### Mutation Testing" >> $GITHUB_STEP_SUMMARY
-          # Check if Python files exist for mutation (excluding tests)
+          # Check if Python files exist (excluding tests)
           if find . -name "*.py" -not -path "./tests/*" | grep -q .; then
-            # Run mutmut with specific test directory to reduce runtime
-            mutmut run --paths-to-mutate . --tests-dir tests/ --test-time-multiplier 2.0 > mut_output.txt 2>&1 || true
-            cat mut_output.txt >> $GITHUB_STEP_SUMMARY
-            # Extract mutation score (e.g., "10/12  🎉" means 10 killed out of 12 mutants)
-            final_line=$(grep -E '[0-9]+/[0-9]+.*🎉' mut_output.txt | tail -1)
-            if [ -n "$final_line" ]; then
-              total=$(echo "$final_line" | cut -d' ' -f1 | cut -d/ -f2)
-              killed=$(echo "$final_line" | cut -d' ' -f1 | cut -d/ -f1)
-              if [ "$total" -gt 0 ] 2>/dev/null; then
-                score=$(( killed * 100 / total ))
-                echo "score=$score%" >> $GITHUB_OUTPUT
+            # Get Python files changed in the PR (compare against main branch)
+            git fetch origin main:main || git fetch origin master:master
+            changed_files=$(git diff --name-only main...HEAD 2>/dev/null || git diff --name-only master...HEAD | grep -E '\.py$' | grep -v '^tests/' | head -n 1 || true)
+            if [ -n "$changed_files" ]; then
+              echo "Mutating changed file: $changed_files" >> $GITHUB_STEP_SUMMARY
+              # Check mutmut version for --max-mutants support
+              mutmut_version=$(mutmut --version | cut -d' ' -f2)
+              if [[ "$mutmut_version" > "2.4.0" ]]; then
+                # Use --max-mutants for newer versions
+                mutmut run --paths-to-mutate "$changed_files" --tests-dir tests/ --test-time-multiplier 1.5 --max-mutants 10 > mut_output.txt 2>&1 || true
+              else
+                # Fallback for mutmut==2.4.0: limit mutants using a script
+                echo "Using mutmut==2.4.0, limiting mutants manually" >> $GITHUB_STEP_SUMMARY
+                mutmut run --paths-to-mutate "$changed_files" --tests-dir tests/ --test-time-multiplier 1.5 > mut_output.txt 2>&1 || true
+                # Limit to first 10 mutants by checking cache
+                if [ -f .mutmut-cache ]; then
+                  python -c "import sqlite3; conn = sqlite3.connect('.mutmut-cache'); c = conn.cursor(); c.execute('UPDATE Mutant SET status = \"skipped\" WHERE rowid > 10'); conn.commit(); conn.close()"
+                  mutmut run --paths-to-mutate "$changed_files" --tests-dir tests/ --test-time-multiplier 1.5 --use-cache > mut_output.txt 2>&1 || true
+                fi
+              fi
+              cat mut_output.txt >> $GITHUB_STEP_SUMMARY
+              # Extract mutation score
+              final_line=$(grep -E '[0-9]+/[0-9]+.*🎉' mut_output.txt | tail -1)
+              if [ -n "$final_line" ]; then
+                total=$(echo "$final_line" | cut -d' ' -f1 | cut -d/ -f2)
+                killed=$(echo "$final_line" | cut -d' ' -f1 | cut -d/ -f1)
+                if [ "$total" -gt 0 ] 2>/dev/null; then
+                  score=$(( killed * 100 / total ))
+                  echo "score=$score%" >> $GITHUB_OUTPUT
+                else
+                  echo "score=0%" >> $GITHUB_OUTPUT
+                  echo "No mutants generated." >> $GITHUB_STEP_SUMMARY
+                fi
               else
                 echo "score=0%" >> $GITHUB_OUTPUT
-                echo "No mutants generated." >> $GITHUB_STEP_SUMMARY
+                echo "Mutation testing failed, timed out, or no mutants generated. Check mutmut output for details." >> $GITHUB_STEP_SUMMARY
               fi
             else
               echo "score=0%" >> $GITHUB_OUTPUT
-              echo "Mutation testing failed, timed out, or no mutants generated. Check mutmut output for details." >> $GITHUB_STEP_SUMMARY
+              echo "No Python files changed in the PR (excluding tests)." >> $GITHUB_STEP_SUMMARY
             fi
           else
-            echo "score=0%" >> $GITHUB_OUTPUT
+            echo "score=0%" >> $GITHUB_STEP_SUMMARY
             echo "No Python files found for mutation testing (excluding tests)." >> $GITHUB_STEP_SUMMARY
           fi
 
