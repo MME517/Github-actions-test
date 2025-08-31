@@ -38,7 +38,7 @@ jobs:
               pip install -r "$req_file" || echo "Failed to install $req_file" >> $GITHUB_STEP_SUMMARY
             fi
           done
-          # Install testing tools, try mutmut>=2.5.0 with fallback to 2.4.0
+          # Install testing tools, prefer mutmut>=2.5.0 with fallback
           pip install pytest pytest-cov==4.1.0 mutmut==2.5.0 flake8 pytest-asyncio || pip install pytest pytest-cov==4.1.0 mutmut==2.4.0 flake8 pytest-asyncio || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
 
       # Create a .coveragerc file to exclude non-Python files and directories
@@ -86,18 +86,17 @@ jobs:
         timeout-minutes: 10
         run: |
           echo "### Test Execution and Coverage" >> $GITHUB_STEP_SUMMARY
-          # Run pytest with coverage, disabling warnings to reduce overhead
           pytest --cov=. --cov-report=term --cov-config=.coveragerc --disable-pytest-warnings > test_output.txt 2>&1 || true
           cat test_output.txt >> $GITHUB_STEP_SUMMARY
-          # Extract coverage percentage
+
           cov_line=$(grep "TOTAL" test_output.txt | tail -1 | awk '{print $(NF)}' | sed 's/%//')
           if [ -n "$cov_line" ] && [[ "$cov_line" =~ ^[0-9]+$ ]]; then
             echo "coverage=$cov_line%" >> $GITHUB_OUTPUT
           else
             echo "coverage=0%" >> $GITHUB_OUTPUT
-            echo "No coverage data found or no testable code. Check for non-Python files or configuration errors." >> $GITHUB_STEP_SUMMARY
+            echo "No coverage data found or no testable code." >> $GITHUB_STEP_SUMMARY
           fi
-          # Determine test execution status
+
           if grep -q "no tests ran" test_output.txt; then
             echo "status=Success (no tests)" >> $GITHUB_OUTPUT
             echo "No tests found to execute." >> $GITHUB_STEP_SUMMARY
@@ -106,7 +105,7 @@ jobs:
             echo "Test failures detected." >> $GITHUB_STEP_SUMMARY
           elif grep -q "INTERNALERROR" test_output.txt; then
             echo "status=Failure" >> $GITHUB_OUTPUT
-            echo "Internal error in test execution. See details above." >> $GITHUB_STEP_SUMMARY
+            echo "Internal error in test execution." >> $GITHUB_STEP_SUMMARY
           else
             echo "status=Success" >> $GITHUB_OUTPUT
             echo "All tests passed or skipped." >> $GITHUB_STEP_SUMMARY
@@ -119,52 +118,46 @@ jobs:
         timeout-minutes: 15
         run: |
           echo "### Mutation Testing" >> $GITHUB_STEP_SUMMARY
-          # Check if Python files exist (excluding tests)
-          if find . -name "*.py" -not -path "./tests/*" | grep -q .; then
-            # Get Python files changed in the PR (compare against main branch)
-            git fetch origin main:main || git fetch origin master:master
-            changed_files=$(git diff --name-only main...HEAD 2>/dev/null || git diff --name-only master...HEAD | grep -E '\.py$' | grep -v '^tests/' | head -n 1 || true)
-            if [ -n "$changed_files" ]; then
-              echo "Mutating changed file: $changed_files" >> $GITHUB_STEP_SUMMARY
-              # Check mutmut version for --max-mutants support
-              mutmut_version=$(mutmut --version | cut -d' ' -f2)
+
+          git fetch origin main:main || git fetch origin master:master
+          changed_files=$(git diff --name-only main...HEAD 2>/dev/null || git diff --name-only master...HEAD)
+          changed_py=$(echo "$changed_files" | grep -E '\.py$' | grep -v '^tests/' | grep -v '^venv/' | grep -v '^.venv/' || true)
+
+          if [ -n "$changed_py" ]; then
+            echo "Changed Python files:" >> $GITHUB_STEP_SUMMARY
+            echo "$changed_py" >> $GITHUB_STEP_SUMMARY
+
+            mutmut_version=$(mutmut --version | cut -d' ' -f2)
+            for file in $changed_py; do
+              echo "Mutating file: $file" >> $GITHUB_STEP_SUMMARY
               if [[ "$mutmut_version" > "2.4.0" ]]; then
-                # Use --max-mutants for newer versions
-                mutmut run --paths-to-mutate "$changed_files" --tests-dir tests/ --test-time-multiplier 1.5 --max-mutants 10 > mut_output.txt 2>&1 || true
+                mutmut run --paths-to-mutate "$file" --tests-dir tests/ --test-time-multiplier 2.0 --max-mutants 25 > mut_output.txt 2>&1 || true
               else
-                # Fallback for mutmut==2.4.0: limit mutants using a script
-                echo "Using mutmut==2.4.0, limiting mutants manually" >> $GITHUB_STEP_SUMMARY
-                mutmut run --paths-to-mutate "$changed_files" --tests-dir tests/ --test-time-multiplier 1.5 > mut_output.txt 2>&1 || true
-                # Limit to first 10 mutants by checking cache
-                if [ -f .mutmut-cache ]; then
-                  python -c "import sqlite3; conn = sqlite3.connect('.mutmut-cache'); c = conn.cursor(); c.execute('UPDATE Mutant SET status = \"skipped\" WHERE rowid > 10'); conn.commit(); conn.close()"
-                  mutmut run --paths-to-mutate "$changed_files" --tests-dir tests/ --test-time-multiplier 1.5 --use-cache > mut_output.txt 2>&1 || true
-                fi
+                echo "Mutmut 2.4.0 detected (no --max-mutants support)" >> $GITHUB_STEP_SUMMARY
+                mutmut run --paths-to-mutate "$file" --tests-dir tests/ --test-time-multiplier 2.0 > mut_output.txt 2>&1 || true
               fi
               cat mut_output.txt >> $GITHUB_STEP_SUMMARY
-              # Extract mutation score
-              final_line=$(grep -E '[0-9]+/[0-9]+.*🎉' mut_output.txt | tail -1)
-              if [ -n "$final_line" ]; then
-                total=$(echo "$final_line" | cut -d' ' -f1 | cut -d/ -f2)
-                killed=$(echo "$final_line" | cut -d' ' -f1 | cut -d/ -f1)
-                if [ "$total" -gt 0 ] 2>/dev/null; then
-                  score=$(( killed * 100 / total ))
-                  echo "score=$score%" >> $GITHUB_OUTPUT
-                else
-                  echo "score=0%" >> $GITHUB_OUTPUT
-                  echo "No mutants generated." >> $GITHUB_STEP_SUMMARY
-                fi
+            done
+
+            summary_line=$(grep -E "Survived|Killed" mut_output.txt | tail -1 || true)
+            if [ -n "$summary_line" ]; then
+              killed=$(echo "$summary_line" | grep -oE 'Killed [0-9]+' | awk '{print $2}')
+              survived=$(echo "$summary_line" | grep -oE 'Survived [0-9]+' | awk '{print $2}')
+              total=$((killed + survived))
+              if [ "$total" -gt 0 ]; then
+                score=$(( killed * 100 / total ))
+                echo "score=$score%" >> $GITHUB_OUTPUT
               else
                 echo "score=0%" >> $GITHUB_OUTPUT
-                echo "Mutation testing failed, timed out, or no mutants generated. Check mutmut output for details." >> $GITHUB_STEP_SUMMARY
+                echo "No mutants generated." >> $GITHUB_STEP_SUMMARY
               fi
             else
               echo "score=0%" >> $GITHUB_OUTPUT
-              echo "No Python files changed in the PR (excluding tests)." >> $GITHUB_STEP_SUMMARY
+              echo "Mutation testing failed or produced no results." >> $GITHUB_STEP_SUMMARY
             fi
           else
-            echo "score=0%" >> $GITHUB_STEP_SUMMARY
-            echo "No Python files found for mutation testing (excluding tests)." >> $GITHUB_STEP_SUMMARY
+            echo "score=0%" >> $GITHUB_OUTPUT
+            echo "No Python files changed in the PR (excluding tests)." >> $GITHUB_STEP_SUMMARY
           fi
 
       # Detect test smells using flake8 on test files
@@ -173,11 +166,9 @@ jobs:
         continue-on-error: true
         run: |
           echo "### Test Smells Detection" >> $GITHUB_STEP_SUMMARY
-          # Check if test files exist
           if find . -type f -name "test_*.py" | grep -q .; then
             find . -type f -name "test_*.py" -exec flake8 {} + > smells_output.txt 2>&1 || true
             cat smells_output.txt >> $GITHUB_STEP_SUMMARY
-            # Count issues as proxy for test smells
             smells_count=$(grep -c ":[0-9]*:[0-9]*:" smells_output.txt || echo 0)
             echo "smells=$smells_count" >> $GITHUB_OUTPUT
             if [ "$smells_count" -eq 0 ]; then
@@ -190,7 +181,7 @@ jobs:
             echo "No test files found." >> $GITHUB_STEP_SUMMARY
           fi
 
-      # Summarize all results in a clear format
+      # Summarize all results
       - name: Overall Summary
         run: |
           echo "## Results Summary" >> $GITHUB_STEP_SUMMARY
