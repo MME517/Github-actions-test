@@ -1,4 +1,5 @@
-name: Enhanced Test Metrics vv
+
+name: Enhanced Test Metrics v4
 
 on:
   workflow_dispatch:
@@ -28,10 +29,8 @@ on:
         default: 45
 
 env:
-  # Global retry settings
   MAX_RETRIES: 3
   RETRY_DELAY: 5
-  # Resource limits
   MAX_DISK_USAGE_MB: 5000
   MAX_MEMORY_USAGE_MB: 3000
 
@@ -45,50 +44,41 @@ jobs:
       - name: Validate inputs
         id: validate
         run: |
-          # Validate repository format
           if [[ ! "${{ github.event.inputs.repo }}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
             echo "❌ Invalid repository format: ${{ github.event.inputs.repo }}"
-            echo "Expected format: owner/repository"
             exit 1
           fi
           
-          # Validate PR number
           if [[ ! "${{ github.event.inputs.pr_number }}" =~ ^[0-9]+$ ]]; then
             echo "❌ Invalid PR number: ${{ github.event.inputs.pr_number }}"
-            echo "Expected: positive integer"
             exit 1
           fi
           
-          # Check timeout
           timeout=${{ github.event.inputs.timeout_minutes }}
           if [[ $timeout -lt 5 || $timeout -gt 120 ]]; then
             echo "❌ Invalid timeout: $timeout minutes"
-            echo "Expected: 5-120 minutes"
             exit 1
           fi
           
           echo "✅ All inputs validated successfully"
           echo "validated=true" >> $GITHUB_OUTPUT
 
-  test-metrics:
+  setup-environment:
     needs: validate-inputs
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes) }}
-    
+    timeout-minutes: 10
+    outputs:
+      setup_complete: ${{ steps.setup.outputs.setup_complete }}
     steps:
-      - name: Setup workspace
+      - name: Setup workspace and utilities
+        id: setup
         run: |
-          # Create working directories
           mkdir -p {logs,reports,artifacts,temp}
           
-          # Set up error handling
-          set -euo pipefail
-          
-          # Create utility functions file
-          cat > utils.sh << 'UTILS_EOF'
+          # Create utility functions
+          cat > utils.sh << 'EOF'
           #!/bin/bash
           
-          # Retry function with exponential backoff
           retry() {
             local retries=$1
             shift
@@ -97,11 +87,11 @@ jobs:
               exit_code=$?
               count=$((count + 1))
               if [ $count -le $retries ]; then
-                wait_time=$((2 ** (count - 1) * RETRY_DELAY))
-                echo "⏳ Attempt $count failed (exit code: $exit_code), retrying in ${wait_time}s..."
+                wait_time=$((2 ** (count - 1) * ${RETRY_DELAY:-5}))
+                echo "⏳ Attempt $count failed, retrying in ${wait_time}s..."
                 sleep $wait_time
               else
-                echo "❌ All $retries attempts failed, giving up"
+                echo "❌ All $retries attempts failed"
                 return $exit_code
               fi
             done
@@ -109,41 +99,16 @@ jobs:
             return 0
           }
           
-          # Check disk space
           check_disk_space() {
             local available=$(df . --output=avail -B1M | tail -1 | tr -d ' ')
-            if [ $available -lt $MAX_DISK_USAGE_MB ]; then
-              echo "❌ Insufficient disk space: ${available}MB available, ${MAX_DISK_USAGE_MB}MB required"
+            if [ $available -lt ${MAX_DISK_USAGE_MB:-5000} ]; then
+              echo "❌ Insufficient disk space: ${available}MB available"
               return 1
             fi
             echo "✅ Disk space OK: ${available}MB available"
             return 0
           }
           
-          # Monitor memory usage
-          check_memory() {
-            local available=$(free -m | awk 'NR==2{printf "%d", $7}')
-            if [ $available -lt $MAX_MEMORY_USAGE_MB ]; then
-              echo "⚠️  Low memory: ${available}MB available"
-            fi
-          }
-          
-          # Safe file operations
-          safe_copy() {
-            local src="$1"
-            local dst="$2"
-            if [ -f "$src" ]; then
-              cp "$src" "$dst" 2>/dev/null || echo "⚠️  Failed to copy $src to $dst"
-            fi
-          }
-          
-          # Cleanup function
-          cleanup_temp() {
-            rm -rf temp/* 2>/dev/null || true
-            docker system prune -f 2>/dev/null || true
-          }
-          
-          # Log function with timestamps
           log_info() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $*"
           }
@@ -155,109 +120,121 @@ jobs:
           log_error() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $*"
           }
-          UTILS_EOF
+          
+          cleanup_temp() {
+            rm -rf temp/* 2>/dev/null || true
+          }
+          EOF
           
           chmod +x utils.sh
-          source utils.sh
-          
-          log_info "Workspace setup completed"
-          check_disk_space
-          check_memory
+          echo "setup_complete=true" >> $GITHUB_OUTPUT
 
-      - name: Checkout PR code with validation
+      - name: Upload utilities
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-utils
+          path: |
+            utils.sh
+            logs/
+            reports/
+            artifacts/
+            temp/
+          retention-days: 1
+
+  checkout-code:
+    needs: [validate-inputs, setup-environment]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download utilities
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace-utils
+
+      - name: Checkout PR code
         run: |
           source utils.sh
+          log_info "Checking out ${{ github.event.inputs.repo }}#${{ github.event.inputs.pr_number }}"
           
-          log_info "Starting checkout process for ${{ github.event.inputs.repo }}#${{ github.event.inputs.pr_number }}"
-          
-          # Checkout with retry
           retry $MAX_RETRIES git clone \
-            --depth 1 \
-            --single-branch \
-            --no-tags \
-            https://github.com/${{ github.event.inputs.repo }}.git \
-            repo_code
+            --depth 1 --single-branch --no-tags \
+            https://github.com/${{ github.event.inputs.repo }}.git repo_code
           
           cd repo_code
-          
-          # Fetch PR
-          retry $MAX_RETRIES git fetch origin \
-            pull/${{ github.event.inputs.pr_number }}/head:pr-branch
-          
+          retry $MAX_RETRIES git fetch origin pull/${{ github.event.inputs.pr_number }}/head:pr-branch
           git checkout pr-branch
           
-          # Validate checkout
-          if [ ! -d ".git" ]; then
-            log_error "Git repository validation failed"
-            exit 1
-          fi
-          
-          # Get basic repo info
+          echo "✅ Checkout completed successfully"
           echo "Repository: $(git remote get-url origin)"
           echo "Branch: $(git branch --show-current)"
           echo "Commit: $(git rev-parse HEAD)"
-          echo "Files: $(find . -type f | wc -l)"
-          
-          # Move back to workspace root
-          cd ..
-          mv repo_code/* . 2>/dev/null || true
-          mv repo_code/.[^.]* . 2>/dev/null || true
-          rm -rf repo_code
 
-      # =======================
-      # Enhanced Caching Setup
-      # =======================
+      - name: Upload source code
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-code
+          path: repo_code/
+          retention-days: 1
+
+  setup-caching:
+    needs: [validate-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: Setup comprehensive caching
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/pip
-            ~/.cache/pipenv
             ~/.m2/repository
             ~/.gradle/caches
             ~/.gradle/wrapper
-            ~/.cargo/registry
-            ~/.cargo/git
             ~/.cache/go-build
             ~/go/pkg/mod
-            ~/.cache/vcpkg
-            ~/.conan/data
-          key: ${{ runner.os }}-${{ github.event.inputs.language }}-${{ hashFiles('**/*.lock', '**/*.sum', '**/*.toml', '**/pom.xml', '**/build.gradle*', '**/requirements*.txt', '**/Pipfile*', '**/go.mod', '**/conanfile.txt', '**/vcpkg.json') }}
+          key: ${{ runner.os }}-${{ github.event.inputs.language }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-${{ github.event.inputs.language }}-
             ${{ runner.os }}-
 
-      # =======================
-      # Enhanced Python Setup
-      # =======================
-      - name: Enhanced Python setup
-        if: ${{ github.event.inputs.language == 'python' }}
+  test-python:
+    needs: [checkout-code, setup-caching]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes) }}
+    if: ${{ github.event.inputs.language == 'python' }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+
+      - name: Setup Python environment
         run: |
           source utils.sh
-          
           log_info "Setting up Python environment"
           
-          # Install Python with retry
+          # Move source code
+          cp -r source-code/* . 2>/dev/null || true
+          
+          # Setup Python
           retry $MAX_RETRIES sudo apt-get update
           retry $MAX_RETRIES sudo apt-get install -y python3.11 python3.11-venv python3-pip
           
-          # Create virtual environment
           python3.11 -m venv venv
           source venv/bin/activate
           
-          # Upgrade pip with retry
           retry $MAX_RETRIES pip install --upgrade pip wheel setuptools
+
+      - name: Install Python dependencies
+        run: |
+          source utils.sh
+          source venv/bin/activate
           
-          # Detect and install dependencies
-          log_info "Detecting Python dependencies"
+          log_info "Installing Python dependencies"
           
           DEPS_INSTALLED=false
-          
-          # Try different dependency files in order of preference
-          for dep_file in "requirements.txt" "requirements/requirements.txt" "requirements/base.txt" "pyproject.toml" "setup.py" "Pipfile"; do
+          for dep_file in "requirements.txt" "requirements/requirements.txt" "pyproject.toml" "setup.py"; do
             if [ -f "$dep_file" ]; then
               log_info "Found dependency file: $dep_file"
-              
               case "$dep_file" in
                 "requirements.txt"|"requirements/"*)
                   if retry $MAX_RETRIES pip install -r "$dep_file"; then
@@ -265,30 +242,10 @@ jobs:
                     break
                   fi
                   ;;
-                "pyproject.toml")
+                "pyproject.toml"|"setup.py")
                   if retry $MAX_RETRIES pip install -e .; then
                     DEPS_INSTALLED=true
                     break
-                  fi
-                  ;;
-                "setup.py")
-                  if retry $MAX_RETRIES pip install -e .; then
-                    DEPS_INSTALLED=true
-                    break
-                  fi
-                  ;;
-                "Pipfile")
-                  if command -v pipenv >/dev/null 2>&1; then
-                    if retry $MAX_RETRIES pipenv install --dev; then
-                      DEPS_INSTALLED=true
-                      break
-                    fi
-                  else
-                    pip install pipenv
-                    if retry $MAX_RETRIES pipenv install --dev; then
-                      DEPS_INSTALLED=true
-                      break
-                    fi
                   fi
                   ;;
               esac
@@ -296,1617 +253,572 @@ jobs:
           done
           
           # Install testing tools
-          log_info "Installing Python testing tools"
-          retry $MAX_RETRIES pip install \
-            pytest pytest-cov coverage mutmut lxml \
-            flake8 flake8-pytest-style bandit safety \
-            pytest-xdist pytest-timeout pytest-mock
-          
-          # Verify installation
-          python --version
-          pip list | head -10
-          
-          log_info "Python setup completed successfully"
+          retry $MAX_RETRIES pip install pytest pytest-cov coverage mutmut lxml flake8
 
-      - name: Enhanced Python testing
-        if: ${{ github.event.inputs.language == 'python' }}
+      - name: Run Python tests
         run: |
           source utils.sh
           source venv/bin/activate
+          set +e
           
-          set +e  # Don't exit on test failures
+          log_info "Running Python tests with coverage"
           
-          log_info "Starting Python test execution"
-          
-          # Initialize status flags
-          BUILD_SUCCESS=true
-          TEST_SUCCESS=true
-          COVERAGE_SUCCESS=true
-          MUTATION_SUCCESS=true
-          
-          # Find test directories and files
-          log_info "Discovering test structure"
+          # Find test directories
           TEST_DIRS=()
-          for dir in tests test testing src/tests src/test; do
+          for dir in tests test testing; do
             if [ -d "$dir" ]; then
               TEST_DIRS+=("$dir")
-              log_info "Found test directory: $dir"
             fi
           done
           
-          # If no test directories, look for test files
           if [ ${#TEST_DIRS[@]} -eq 0 ]; then
-            TEST_FILES=$(find . -name "*test*.py" -o -name "test_*.py" | head -20)
+            TEST_FILES=$(find . -name "*test*.py" -o -name "test_*.py" | head -10)
             if [ -n "$TEST_FILES" ]; then
               TEST_DIRS=(".")
-              log_info "Found test files in root directory"
             fi
           fi
           
           if [ ${#TEST_DIRS[@]} -eq 0 ]; then
-            log_warn "No tests found in repository"
             echo "NO_TESTS_FOUND" > logs/test_status.txt
+            log_warn "No tests found"
           else
-            # Run tests with comprehensive coverage
-            log_info "Running pytest with coverage"
-            
             timeout 1800 pytest "${TEST_DIRS[@]}" \
-              --cov=. \
-              --cov-report=xml:reports/coverage.xml \
-              --cov-report=html:reports/coverage_html \
-              --cov-report=term-missing \
-              --cov-fail-under=0 \
-              --junitxml=reports/pytest.xml \
-              --tb=short \
-              --maxfail=50 \
-              -v \
-              --durations=10 \
+              --cov=. --cov-report=xml:reports/coverage.xml \
+              --cov-report=term-missing --tb=short -v \
               > logs/pytest.log 2>&1
             
             TEST_EXIT_CODE=$?
-            
             if [ $TEST_EXIT_CODE -eq 0 ]; then
-              log_info "✅ Tests passed successfully"
               echo "TESTS_PASSED" > logs/test_status.txt
-            elif [ $TEST_EXIT_CODE -eq 124 ]; then
-              log_warn "⏰ Tests timed out after 30 minutes"
-              echo "TESTS_TIMEOUT" > logs/test_status.txt
-              TEST_SUCCESS=false
+              log_info "✅ Tests passed"
+              
+              # Run mutation testing
+              timeout 3600 mutmut run --runner "pytest ${TEST_DIRS[0]} -x -q" \
+                --paths-to-mutate . --simple-output \
+                > logs/mutmut.log 2>&1 || echo "MUTATION_FAILED" > logs/mutation_status.txt
             else
-              log_warn "⚠️  Some tests failed (exit code: $TEST_EXIT_CODE)"
               echo "TESTS_FAILED" > logs/test_status.txt
-              TEST_SUCCESS=false
-            fi
-            
-            # Run mutation testing only if tests pass
-            if [ "$TEST_SUCCESS" = true ]; then
-              log_info "Running mutation testing"
-              
-              timeout 3600 mutmut run \
-                --runner "pytest ${TEST_DIRS[0]} -x -q --tb=no" \
-                --paths-to-mutate . \
-                --tests-dir "${TEST_DIRS[0]}" \
-                --simple-output \
-                --use-coverage \
-                > logs/mutmut.log 2>&1
-              
-              MUTATION_EXIT_CODE=$?
-              
-              if [ $MUTATION_EXIT_CODE -eq 0 ] || [ $MUTATION_EXIT_CODE -eq 1 ]; then
-                log_info "✅ Mutation testing completed"
-                mutmut results > reports/mutations.txt 2>&1 || true
-                mutmut show > reports/mutations_detailed.txt 2>&1 || true
-              else
-                log_warn "⚠️  Mutation testing failed or timed out"
-                echo "MUTATION_FAILED" > logs/mutation_status.txt
-                MUTATION_SUCCESS=false
-              fi
-            else
-              log_info "Skipping mutation testing due to test failures"
-              echo "MUTATION_SKIPPED" > logs/mutation_status.txt
-              MUTATION_SUCCESS=false
+              log_warn "⚠️ Some tests failed"
             fi
             
             # Detect test smells
-            log_info "Detecting test smells"
             flake8 --select=PT --exit-zero "${TEST_DIRS[@]}" > reports/test_smells.txt 2>&1 || true
-            
-            # Additional quality checks
-            bandit -r . -f json -o reports/security.json 2>/dev/null || true
-            safety check --json --output reports/safety.json 2>/dev/null || true
           fi
-          
-          # Store final status
-          echo "BUILD_SUCCESS=$BUILD_SUCCESS" > logs/python_status.env
-          echo "TEST_SUCCESS=$TEST_SUCCESS" >> logs/python_status.env
-          echo "COVERAGE_SUCCESS=$COVERAGE_SUCCESS" >> logs/python_status.env
-          echo "MUTATION_SUCCESS=$MUTATION_SUCCESS" >> logs/python_status.env
-          
-          check_memory
 
-      # =======================
-      # Enhanced C++ Setup
-      # =======================
-      - name: Enhanced C++ setup
-        if: ${{ github.event.inputs.language == 'cpp' }}
+      - name: Upload Python results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-results
+          path: |
+            logs/
+            reports/
+          retention-days: 30
+
+  test-cpp:
+    needs: [checkout-code, setup-caching]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes) }}
+    if: ${{ github.event.inputs.language == 'cpp' }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+
+      - name: Setup C++ environment
         run: |
           source utils.sh
+          cp -r source-code/* . 2>/dev/null || true
           
           log_info "Setting up C++ environment"
-          
-          # Update package list
           retry $MAX_RETRIES sudo apt-get update
-          
-          # Install essential build tools
           retry $MAX_RETRIES sudo apt-get install -y \
             build-essential cmake ninja-build \
             lcov gcovr clang llvm \
-            libcurl4-openssl-dev \
-            libgtest-dev libgmock-dev \
-            libboost-all-dev \
-            pkg-config
-          
-          # Install modern CMake if needed
-          cmake_version=$(cmake --version | grep -oP 'cmake version \K[0-9]+\.[0-9]+' | head -1)
-          if [ "$(echo "$cmake_version < 3.20" | bc -l 2>/dev/null || echo 1)" -eq 1 ]; then
-            log_info "Installing latest CMake"
-            retry $MAX_RETRIES wget -O cmake.sh https://github.com/Kitware/CMake/releases/download/v3.27.7/cmake-3.27.7-linux-x86_64.sh
-            sudo sh cmake.sh --prefix=/usr/local --skip-license
-            rm cmake.sh
-          fi
-          
-          # Try to install mutation testing tools
-          log_info "Installing mutation testing tools"
-          
-          # Try mull
-          MULL_URL="https://github.com/mull-project/mull/releases/download/0.20.0/mull-0.20.0-Ubuntu-22.04.deb"
-          if retry 2 wget -q "$MULL_URL" -O mull.deb; then
-            sudo dpkg -i mull.deb 2>/dev/null || true
-            sudo apt-get install -f -y || true
-            rm mull.deb
-          fi
-          
-          log_info "C++ setup completed"
+            libgtest-dev libgmock-dev
 
-      - name: Enhanced C++ testing
-        if: ${{ github.event.inputs.language == 'cpp' }}
+      - name: Build and test C++
         run: |
           source utils.sh
-          
           set +e
-          log_info "Starting C++ build and test process"
           
-          BUILD_SUCCESS=true
-          TEST_SUCCESS=true
+          mkdir -p build && cd build
           
-          # Create build directory
-          mkdir -p build
-          cd build
+          # Configure with coverage
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="--coverage -g -O0" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
+            > ../logs/cmake.log 2>&1
           
-          # Configure build with coverage
-          log_info "Configuring CMake build"
+          CMAKE_EXIT_CODE=$?
+          if [ $CMAKE_EXIT_CODE -ne 0 ]; then
+            echo "BUILD_FAILED" > ../logs/build_status.txt
+            exit 0
+          fi
           
-          CMAKE_FLAGS=(
-            -DCMAKE_BUILD_TYPE=Debug
-            -DCMAKE_CXX_FLAGS="--coverage -g -O0 -fprofile-arcs -ftest-coverage -Wall -Wextra"
-            -DCMAKE_C_FLAGS="--coverage -g -O0 -fprofile-arcs -ftest-coverage -Wall -Wextra"
-            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
-            -DBUILD_TESTING=ON
-          )
+          # Build
+          make -j$(nproc) > ../logs/build.log 2>&1
+          BUILD_EXIT_CODE=$?
           
-          # Try different generators
-          for generator in "Ninja" "Unix Makefiles"; do
-            log_info "Trying CMake generator: $generator"
-            
-            if cmake .. -G "$generator" "${CMAKE_FLAGS[@]}" > ../logs/cmake.log 2>&1; then
-              log_info "✅ CMake configuration successful with $generator"
-              break
-            else
-              log_warn "⚠️  CMake failed with $generator"
-              if [ "$generator" = "Unix Makefiles" ]; then
-                log_error "❌ All CMake generators failed"
-                BUILD_SUCCESS=false
-                cd ..
-                echo "BUILD_FAILED" > logs/build_status.txt
-                exit 0
+          if [ $BUILD_EXIT_CODE -eq 0 ]; then
+            # Run tests
+            if command -v ctest &> /dev/null; then
+              ctest --output-on-failure -V > ../logs/ctest.log 2>&1
+              TEST_EXIT_CODE=$?
+              if [ $TEST_EXIT_CODE -eq 0 ]; then
+                echo "TESTS_PASSED" > ../logs/test_status.txt
+              else
+                echo "TESTS_FAILED" > ../logs/test_status.txt
               fi
             fi
-          done
-          
-          if [ "$BUILD_SUCCESS" = true ]; then
-            # Build project
-            log_info "Building project"
             
-            if command -v ninja >/dev/null 2>&1 && [ -f "build.ninja" ]; then
-              BUILD_CMD="ninja -j$(nproc)"
-            else
-              BUILD_CMD="make -j$(nproc)"
-            fi
-            
-            timeout 1800 $BUILD_CMD > ../logs/build.log 2>&1
-            BUILD_EXIT_CODE=$?
-            
-            if [ $BUILD_EXIT_CODE -eq 0 ]; then
-              log_info "✅ Build successful"
-            elif [ $BUILD_EXIT_CODE -eq 124 ]; then
-              log_error "❌ Build timed out"
-              BUILD_SUCCESS=false
-            else
-              log_error "❌ Build failed"
-              BUILD_SUCCESS=false
-            fi
-          fi
-          
-          if [ "$BUILD_SUCCESS" = true ]; then
-            # Run tests
-            log_info "Running tests"
-            
-            if command -v ctest >/dev/null 2>&1; then
-              timeout 1800 ctest --output-on-failure --parallel $(nproc) -V > ../logs/ctest.log 2>&1
-              TEST_EXIT_CODE=$?
-            else
-              # Find and run test executables
-              log_info "CTest not available, searching for test executables"
-              find . -type f -executable \( -name "*test*" -o -name "*Test*" \) | while read test_exe; do
-                log_info "Running: $test_exe"
-                timeout 300 "$test_exe" || true
-              done > ../logs/tests.log 2>&1
-              TEST_EXIT_CODE=$?
-            fi
-            
-            if [ $TEST_EXIT_CODE -eq 0 ]; then
-              log_info "✅ Tests passed"
-              echo "TESTS_PASSED" > ../logs/test_status.txt
-            else
-              log_warn "⚠️  Some tests failed"
-              echo "TESTS_FAILED" > ../logs/test_status.txt
-              TEST_SUCCESS=false
-            fi
-            
-            # Generate coverage report
+            # Generate coverage
             cd ..
-            log_info "Generating coverage report"
-            
-            gcovr -r . \
-              --xml -o reports/coverage.xml \
-              --html-details -o reports/coverage.html \
-              --print-summary \
-              --exclude-unreachable-branches \
-              --exclude-throw-branches \
-              > logs/coverage.log 2>&1 || true
-            
-            # Try mutation testing
-            if [ "$TEST_SUCCESS" = true ] && command -v mull-runner >/dev/null 2>&1; then
-              log_info "Running mutation testing"
-              cd build
-              timeout 3600 mull-runner . \
-                --reporters=Elements \
-                --output=../reports/mutations.json \
-                > ../logs/mull.log 2>&1 || log_warn "Mutation testing failed"
-              cd ..
-            fi
+            gcovr -r . --xml -o reports/coverage.xml \
+              --print-summary > logs/coverage.log 2>&1 || true
+          else
+            echo "BUILD_FAILED" > ../logs/build_status.txt
           fi
-          
-          # Store status
-          echo "BUILD_SUCCESS=$BUILD_SUCCESS" > logs/cpp_status.env
-          echo "TEST_SUCCESS=$TEST_SUCCESS" >> logs/cpp_status.env
 
-      # =======================
-      # Enhanced Java Setup
-      # =======================
-      - name: Enhanced Java setup
-        if: ${{ github.event.inputs.language == 'java' }}
+      - name: Upload C++ results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-results
+          path: |
+            logs/
+            reports/
+          retention-days: 30
+
+  test-java:
+    needs: [checkout-code, setup-caching]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes) }}
+    if: ${{ github.event.inputs.language == 'java' }}
+    steps:
+      - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Enhanced Java testing
-        if: ${{ github.event.inputs.language == 'java' }}
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+
+      - name: Build and test Java
         run: |
           source utils.sh
-          
+          cp -r source-code/* . 2>/dev/null || true
           set +e
-          log_info "Starting Java build and test process"
           
-          BUILD_SUCCESS=true
-          TEST_SUCCESS=true
-          
-          # Detect build system
           if [ -f "pom.xml" ]; then
-            BUILD_SYSTEM="maven"
-            log_info "Detected Maven project"
-          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            BUILD_SYSTEM="gradle"
-            log_info "Detected Gradle project"
-          else
-            log_error "❌ No recognized Java build system found"
-            echo "BUILD_FAILED" > logs/build_status.txt
-            BUILD_SUCCESS=false
-          fi
-          
-          if [ "$BUILD_SYSTEM" = "maven" ]; then
-            # Maven build
             log_info "Building with Maven"
             
-            # Clean and compile
-            timeout 1800 mvn clean compile -B -V > logs/maven_compile.log 2>&1
+            timeout 1800 mvn clean compile -B > logs/maven_compile.log 2>&1
             COMPILE_EXIT_CODE=$?
             
             if [ $COMPILE_EXIT_CODE -eq 0 ]; then
-              log_info "✅ Maven compilation successful"
-              
-              # Run tests with JaCoCo
-              log_info "Running Maven tests with coverage"
               timeout 2400 mvn test jacoco:report -B > logs/maven_test.log 2>&1
               TEST_EXIT_CODE=$?
               
               if [ $TEST_EXIT_CODE -eq 0 ]; then
-                log_info "✅ Maven tests passed"
                 echo "TESTS_PASSED" > logs/test_status.txt
-              else
-                log_warn "⚠️  Some Maven tests failed"
-                echo "TESTS_FAILED" > logs/test_status.txt
-                TEST_SUCCESS=false
-              fi
-              
-              # Generate additional reports
-              mvn surefire-report:report site -DgenerateReports=false > logs/maven_reports.log 2>&1 || true
-              
-              # Run mutation testing with PIT
-              if [ "$TEST_SUCCESS" = true ]; then
-                log_info "Running PIT mutation testing"
+                
+                # Run PIT mutation testing
                 timeout 3600 mvn org.pitest:pitest-maven:mutationCoverage \
-                  -DoutputFormats=XML,HTML \
-                  -DwithHistory=true \
-                  > logs/pitest.log 2>&1 || log_warn "PIT mutation testing failed"
+                  -DoutputFormats=XML > logs/pitest.log 2>&1 || true
+              else
+                echo "TESTS_FAILED" > logs/test_status.txt
               fi
-              
             else
-              log_error "❌ Maven compilation failed"
-              BUILD_SUCCESS=false
+              echo "BUILD_FAILED" > logs/build_status.txt
             fi
             
-          elif [ "$BUILD_SYSTEM" = "gradle" ]; then
-            # Gradle build
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
             log_info "Building with Gradle"
-            
-            # Make gradlew executable
             [ -f "gradlew" ] && chmod +x gradlew
             GRADLE_CMD=$([ -f "gradlew" ] && echo "./gradlew" || echo "gradle")
             
-            # Clean and build
-            timeout 1800 $GRADLE_CMD clean build --info > logs/gradle_build.log 2>&1
+            timeout 1800 $GRADLE_CMD clean build > logs/gradle_build.log 2>&1
             BUILD_EXIT_CODE=$?
             
             if [ $BUILD_EXIT_CODE -eq 0 ]; then
-              log_info "✅ Gradle build successful"
-              
-              # Run tests
-              log_info "Running Gradle tests"
-              timeout 2400 $GRADLE_CMD test jacocoTestReport --info > logs/gradle_test.log 2>&1
+              timeout 2400 $GRADLE_CMD test jacocoTestReport > logs/gradle_test.log 2>&1
               TEST_EXIT_CODE=$?
               
               if [ $TEST_EXIT_CODE -eq 0 ]; then
-                log_info "✅ Gradle tests passed"
                 echo "TESTS_PASSED" > logs/test_status.txt
               else
-                log_warn "⚠️  Some Gradle tests failed"
                 echo "TESTS_FAILED" > logs/test_status.txt
-                TEST_SUCCESS=false
               fi
-              
-              # Run PIT if available
-              if [ "$TEST_SUCCESS" = true ]; then
-                log_info "Running PIT mutation testing"
-                timeout 3600 $GRADLE_CMD pitest > logs/gradle_pitest.log 2>&1 || log_warn "PIT mutation testing failed"
-              fi
-              
             else
-              log_error "❌ Gradle build failed"
-              BUILD_SUCCESS=false
+              echo "BUILD_FAILED" > logs/build_status.txt
             fi
+          else
+            echo "BUILD_FAILED" > logs/build_status.txt
+            log_error "No recognized Java build system found"
           fi
-          
-          # Test smell detection
-          if [ "$BUILD_SUCCESS" = true ]; then
-            log_info "Detecting test smells"
-            
-            # Download TestSmellDetector
-            DETECTOR_URL="https://github.com/TestSmells/TestSmellDetector/releases/download/v1.0/TestSmellDetector.jar"
-            if retry 3 wget -q "$DETECTOR_URL" -O TestSmellDetector.jar; then
-              TEST_DIRS=$(find . -type d -path "*/src/test/java" -o -path "*/test/java" | head -5)
-              for test_dir in $TEST_DIRS; do
-                if [ -d "$test_dir" ]; then
-                  timeout 600 java -jar TestSmellDetector.jar -p "$test_dir" -o "reports/test_smells_${test_dir//\//_}.csv" 2>/dev/null || true
-                fi
-              done
-            fi
-          fi
-          
-          # Store status
-          echo "BUILD_SUCCESS=$BUILD_SUCCESS" > logs/java_status.env
-          echo "TEST_SUCCESS=$TEST_SUCCESS" >> logs/java_status.env
 
-      # =======================
-      # Enhanced Kotlin Setup
-      # =======================
-      - name: Enhanced Kotlin setup
-        if: ${{ github.event.inputs.language == 'kotlin' }}
+      - name: Upload Java results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-results
+          path: |
+            logs/
+            reports/
+          retention-days: 30
+
+  test-kotlin:
+    needs: [checkout-code, setup-caching]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes) }}
+    if: ${{ github.event.inputs.language == 'kotlin' }}
+    steps:
+      - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Enhanced Kotlin testing
-        if: ${{ github.event.inputs.language == 'kotlin' }}
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+
+      - name: Build and test Kotlin
         run: |
           source utils.sh
-          
+          cp -r source-code/* . 2>/dev/null || true
           set +e
-          log_info "Starting Kotlin build and test process"
           
-          BUILD_SUCCESS=true
-          TEST_SUCCESS=true
-          
-          # Make gradlew executable
           [ -f "gradlew" ] && chmod +x gradlew
           GRADLE_CMD=$([ -f "gradlew" ] && echo "./gradlew" || echo "gradle")
           
-          # Clean and build
           log_info "Building Kotlin project"
-          timeout 1800 $GRADLE_CMD clean build --info > logs/kotlin_build.log 2>&1
+          timeout 1800 $GRADLE_CMD clean build > logs/kotlin_build.log 2>&1
           BUILD_EXIT_CODE=$?
           
           if [ $BUILD_EXIT_CODE -eq 0 ]; then
-            log_info "✅ Kotlin build successful"
-            
-            # Run tests
-            log_info "Running Kotlin tests"
-            timeout 2400 $GRADLE_CMD test --info > logs/kotlin_test.log 2>&1
+            timeout 2400 $GRADLE_CMD test > logs/kotlin_test.log 2>&1
             TEST_EXIT_CODE=$?
             
             if [ $TEST_EXIT_CODE -eq 0 ]; then
-              log_info "✅ Kotlin tests passed"
               echo "TESTS_PASSED" > logs/test_status.txt
+              
+              # Generate coverage with Kover
+              $GRADLE_CMD koverXmlReport > logs/kover.log 2>&1 || true
             else
-              log_warn "⚠️  Some Kotlin tests failed"
               echo "TESTS_FAILED" > logs/test_status.txt
-              TEST_SUCCESS=false
             fi
-            
-            # Generate coverage with Kover
-            log_info "Generating Kover coverage report"
-            $GRADLE_CMD koverXmlReport koverHtmlReport > logs/kover.log 2>&1 || true
-            
-            # Run mutation testing
-            if [ "$TEST_SUCCESS" = true ]; then
-              log_info "Running PIT mutation testing"
-              timeout 3600 $GRADLE_CMD pitest > logs/kotlin_pitest.log 2>&1 || log_warn "PIT mutation testing failed"
-            fi
-            
-            # Run Detekt for code quality
-            log_info "Running Detekt analysis"
-            $GRADLE_CMD detekt > logs/detekt.log 2>&1 || true
-            
           else
-            log_error "❌ Kotlin build failed"
-            BUILD_SUCCESS=false
+            echo "BUILD_FAILED" > logs/build_status.txt
           fi
-          
-          # Store status
-          echo "BUILD_SUCCESS=$BUILD_SUCCESS" > logs/kotlin_status.env
-          echo "TEST_SUCCESS=$TEST_SUCCESS" >> logs/kotlin_status.env
 
-      # =======================
-      # Enhanced Go Setup
-      # =======================
-      - name: Enhanced Go setup
-        if: ${{ github.event.inputs.language == 'go' }}
+      - name: Upload Kotlin results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-results
+          path: |
+            logs/
+            reports/
+          retention-days: 30
+
+  test-go:
+    needs: [checkout-code, setup-caching]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes) }}
+    if: ${{ github.event.inputs.language == 'go' }}
+    steps:
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
 
-      - name: Enhanced Go testing
-        if: ${{ github.event.inputs.language == 'go' }}
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+
+      - name: Build and test Go
         run: |
           source utils.sh
-          
+          cp -r source-code/* . 2>/dev/null || true
           set +e
-          log_info "Starting Go build and test process"
           
-          BUILD_SUCCESS=true
-          TEST_SUCCESS=true
+          # Initialize module if needed
+          [ ! -f "go.mod" ] && go mod init temp-module 2>/dev/null || true
           
-          # Initialize Go module if needed
-          if [ ! -f "go.mod" ]; then
-            log_info "Initializing Go module"
-            go mod init temp-module 2>/dev/null || true
-          fi
-          
-          # Download dependencies
           log_info "Downloading Go dependencies"
           retry $MAX_RETRIES go mod download
           go mod tidy 2>/dev/null || true
           
-          # Build project
-          log_info "Building Go project"
+          # Build
           timeout 1200 go build -v ./... > logs/go_build.log 2>&1
           BUILD_EXIT_CODE=$?
           
           if [ $BUILD_EXIT_CODE -eq 0 ]; then
-            log_info "✅ Go build successful"
-            
             # Run tests with coverage
-            log_info "Running Go tests with coverage"
-            timeout 2400 go test -v -race -coverprofile=reports/coverage.out -covermode=atomic ./... > logs/go_test.log 2>&1
+            timeout 2400 go test -v -race -coverprofile=reports/coverage.out \
+              -covermode=atomic ./... > logs/go_test.log 2>&1
             TEST_EXIT_CODE=$?
             
             if [ $TEST_EXIT_CODE -eq 0 ]; then
-              log_info "✅ Go tests passed"
               echo "TESTS_PASSED" > logs/test_status.txt
-            else
-              log_warn "⚠️  Some Go tests failed"
-              echo "TESTS_FAILED" > logs/test_status.txt
-              TEST_SUCCESS=false
-            fi
-            
-            # Generate coverage reports
-            if [ -f "reports/coverage.out" ]; then
-              log_info "Generating coverage reports"
-              go tool cover -func=reports/coverage.out > reports/coverage.txt 2>&1 || true
-              go tool cover -html=reports/coverage.out -o reports/coverage.html 2>&1 || true
               
-              # Convert to Cobertura XML
-              if retry 2 go install github.com/t-yuki/gocover-cobertura@latest; then
-                gocover-cobertura < reports/coverage.out > reports/coverage.xml 2>&1 || true
-              fi
-            fi
-            
-            # Run mutation testing
-            if [ "$TEST_SUCCESS" = true ]; then
-              log_info "Installing and running mutation testing"
-              if retry 2 go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest; then
-                timeout 3600 go-mutesting --json ./... > reports/mutations.json 2>&1 || log_warn "Mutation testing failed"
-              fi
-            fi
-            
-            # Detect test smells
-            log_info "Detecting Go test smells"
-            TEST_SMELLS=0
-            
-            # Count TODO/FIXME in test files
-            TODO_COUNT=$(grep -r "TODO\|FIXME" --include="*_test.go" . 2>/dev/null | wc -l || echo 0)
-            TEST_SMELLS=$((TEST_SMELLS + TODO_COUNT))
-            
-            # Count tests without proper assertions
-            NO_ASSERT=$(find . -name "*_test.go" -exec grep -L "testing\.T" {} \; 2>/dev/null | wc -l || echo 0)
-            TEST_SMELLS=$((TEST_SMELLS + NO_ASSERT))
-            
-            # Count empty test functions
-            EMPTY_TESTS=$(grep -r "func Test" --include="*_test.go" . 2>/dev/null | \
-              while IFS= read -r line; do
-                file=$(echo "$line" | cut -d: -f1)
-                func_line=$(echo "$line" | cut -d: -f2-)
-                if [ -f "$file" ]; then
-                  func_name=$(echo "$func_line" | grep -o "func Test[^(]*")
-                  if ! grep -A 10 "$func_name" "$file" | grep -q -E "(t\.Error|t\.Fatal|t\.Fail|assert|require)" 2>/dev/null; then
-                    echo "1"
-                  fi
+              # Generate coverage reports
+              if [ -f "reports/coverage.out" ]; then
+                go tool cover -func=reports/coverage.out > reports/coverage.txt 2>&1 || true
+                
+                # Convert to XML if tool is available
+                if go install github.com/t-yuki/gocover-cobertura@latest 2>/dev/null; then
+                  gocover-cobertura < reports/coverage.out > reports/coverage.xml 2>&1 || true
                 fi
-              done | wc -l || echo 0)
-            TEST_SMELLS=$((TEST_SMELLS + EMPTY_TESTS))
-            
-            echo "$TEST_SMELLS" > reports/test_smells.txt
-            log_info "Detected $TEST_SMELLS test smells"
-            
+              fi
+              
+              # Simple test smell detection
+              TEST_SMELLS=0
+              TODO_COUNT=$(grep -r "TODO\|FIXME" --include="*_test.go" . 2>/dev/null | wc -l || echo 0)
+              TEST_SMELLS=$((TEST_SMELLS + TODO_COUNT))
+              echo "$TEST_SMELLS" > reports/test_smells.txt
+            else
+              echo "TESTS_FAILED" > logs/test_status.txt
+            fi
           else
-            log_error "❌ Go build failed"
-            BUILD_SUCCESS=false
+            echo "BUILD_FAILED" > logs/build_status.txt
           fi
-          
-          # Store status
-          echo "BUILD_SUCCESS=$BUILD_SUCCESS" > logs/go_status.env
-          echo "TEST_SUCCESS=$TEST_SUCCESS" >> logs/go_status.env
 
-      # =======================
-      # Enhanced Metrics Parsing
-      # =======================
-      - name: Parse and validate metrics
+      - name: Upload Go results
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-results
+          path: |
+            logs/
+            reports/
+          retention-days: 30
+
+  parse-metrics:
+    needs: [test-python, test-cpp, test-java, test-kotlin, test-go]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-results"
+
+      - name: Download utilities
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace-utils
+
+      - name: Parse and analyze metrics
         run: |
           source utils.sh
           
-          log_info "Starting comprehensive metrics parsing"
+          # Merge all results
+          mkdir -p {logs,reports}
+          find . -name "logs" -type d -exec cp -r {}/* logs/ \; 2>/dev/null || true
+          find . -name "reports" -type d -exec cp -r {}/* reports/ \; 2>/dev/null || true
           
-          python3 <<'METRICS_EOF'
+          log_info "Starting metrics parsing"
+          
+          python3 << 'EOF'
           import json
-          import glob
           import os
           import xml.etree.ElementTree as ET
-          import sqlite3
           import re
-          import sys
-          import csv
-          from pathlib import Path
           from datetime import datetime
-          import traceback
 
-          # Configuration
-          LANGUAGE = "${{ github.event.inputs.language }}"
-          REPO = "${{ github.event.inputs.repo }}"
-          PR_NUMBER = "${{ github.event.inputs.pr_number }}"
+          # Initialize metrics
+          metrics = {
+              "repo": "${{ github.event.inputs.repo }}",
+              "pr_number": "${{ github.event.inputs.pr_number }}",
+              "language": "${{ github.event.inputs.language }}",
+              "coverage": None,
+              "mutation_score": None,
+              "compilation_success": True,
+              "execution_success": True,
+              "test_smells": 0,
+              "timestamp": datetime.now().isoformat()
+          }
 
-          class MetricsParser:
-              def __init__(self):
-                  self.metrics = {
-                      "repo": REPO,
-                      "pr_number": PR_NUMBER,
-                      "language": LANGUAGE,
-                      "coverage": None,
-                      "mutation_score": None,
-                      "compilation_success": None,
-                      "execution_success": None,
-                      "test_smells": None,
-                      "additional_metrics": {},
-                      "timestamp": datetime.now().isoformat(),
-                      "workflow_run": os.environ.get('GITHUB_RUN_ID', 'unknown')
-                  }
-                  
-              def log(self, message, level="INFO"):
-                  print(f"[{level}] {message}")
-                  
-              def safe_parse_xml(self, file_path):
-                  """Safely parse XML with comprehensive error handling"""
+          # Check build/test status
+          if os.path.exists("logs/build_status.txt"):
+              with open("logs/build_status.txt") as f:
+                  if "BUILD_FAILED" in f.read():
+                      metrics["compilation_success"] = False
+
+          if os.path.exists("logs/test_status.txt"):
+              with open("logs/test_status.txt") as f:
+                  content = f.read()
+                  if "TESTS_FAILED" in content:
+                      metrics["execution_success"] = False
+                  elif "NO_TESTS_FOUND" in content:
+                      metrics["execution_success"] = None
+
+          # Parse coverage
+          coverage_files = ["reports/coverage.xml", "coverage.xml"]
+          for cov_file in coverage_files:
+              if os.path.exists(cov_file):
                   try:
-                      if not os.path.exists(file_path):
-                          return None
-                      
-                      if os.path.getsize(file_path) == 0:
-                          self.log(f"Empty XML file: {file_path}", "WARN")
-                          return None
-                      
-                      tree = ET.parse(file_path)
+                      tree = ET.parse(cov_file)
                       root = tree.getroot()
                       
-                      if root is None:
-                          self.log(f"Invalid XML root: {file_path}", "WARN")
-                          return None
-                          
-                      return tree
-                  except ET.ParseError as e:
-                      self.log(f"XML parse error in {file_path}: {e}", "WARN")
-                  except Exception as e:
-                      self.log(f"Unexpected error parsing {file_path}: {e}", "ERROR")
-                  return None
-              
-              def find_files(self, pattern, recursive=True):
-                  """Find files with improved pattern matching"""
-                  try:
-                      if recursive:
-                          files = list(Path('.').rglob(pattern))
-                      else:
-                          files = list(Path('.').glob(pattern))
-                      return [str(f) for f in files if f.is_file()]
-                  except Exception as e:
-                      self.log(f"Error finding files with pattern {pattern}: {e}", "ERROR")
-                      return []
-              
-              def parse_build_status(self):
-                  """Parse build and execution status from all languages"""
-                  self.log("Parsing build and execution status")
-                  
-                  # Check for language-specific status files
-                  status_files = [
-                      f"logs/{LANGUAGE}_status.env",
-                      "logs/build_status.txt",
-                      "logs/test_status.txt"
-                  ]
-                  
-                  build_success = True
-                  test_success = True
-                  
-                  # Parse environment status files
-                  for status_file in status_files:
-                      if os.path.exists(status_file):
-                          try:
-                              with open(status_file, 'r') as f:
-                                  content = f.read().strip()
-                                  
-                                  if "BUILD_SUCCESS=false" in content or "BUILD_FAILED" in content:
-                                      build_success = False
-                                  if "TEST_SUCCESS=false" in content or "TESTS_FAILED" in content:
-                                      test_success = False
-                          except Exception as e:
-                              self.log(f"Error reading {status_file}: {e}", "WARN")
-                  
-                  self.metrics["compilation_success"] = build_success
-                  self.metrics["execution_success"] = test_success
-                  
-                  self.log(f"Build success: {build_success}")
-                  self.log(f"Test success: {test_success}")
-              
-              def parse_coverage(self):
-                  """Enhanced coverage parsing for all supported formats"""
-                  self.log("Parsing coverage data")
-                  
-                  coverage = None
-                  
-                  # Coverage file patterns by format
-                  coverage_patterns = [
-                      ("Cobertura", ["**/coverage.xml", "reports/coverage.xml"]),
-                      ("JaCoCo", ["**/jacoco*.xml", "**/site/jacoco/jacoco.xml", "build/reports/jacoco/test/jacocoTestReport.xml"]),
-                      ("Kover", ["**/kover*.xml", "**/reports/kover/report.xml", "build/reports/kover/report.xml"]),
-                      ("LCOV", ["**/lcov.info", "**/*.lcov", "reports/coverage.info"]),
-                      ("Go Text", ["reports/coverage.txt", "coverage.txt"]),
-                      ("Go Out", ["reports/coverage.out", "coverage.out"])
-                  ]
-                  
-                  for format_name, patterns in coverage_patterns:
-                      if coverage is not None:
-                          break
-                          
-                      for pattern in patterns:
-                          files = self.find_files(pattern)
-                          for file_path in files:
-                              if coverage is not None:
-                                  break
-                                  
-                              self.log(f"Checking {format_name} coverage file: {file_path}")
-                              
-                              try:
-                                  if format_name in ["Cobertura", "JaCoCo", "Kover"]:
-                                      coverage = self._parse_xml_coverage(file_path, format_name)
-                                  elif format_name == "LCOV":
-                                      coverage = self._parse_lcov_coverage(file_path)
-                                  elif format_name == "Go Text":
-                                      coverage = self._parse_go_text_coverage(file_path)
-                                  elif format_name == "Go Out":
-                                      coverage = self._parse_go_out_coverage(file_path)
-                                      
-                                  if coverage is not None:
-                                      self.log(f"✅ Found {format_name} coverage: {coverage:.2f}%")
-                                      break
-                              except Exception as e:
-                                  self.log(f"Error parsing {format_name} file {file_path}: {e}", "ERROR")
-                  
-                  self.metrics["coverage"] = round(coverage, 2) if coverage is not None else None
-                  
-                  if coverage is None:
-                      self.log("⚠️  No valid coverage data found", "WARN")
-              
-              def _parse_xml_coverage(self, file_path, format_type):
-                  """Parse XML coverage formats"""
-                  tree = self.safe_parse_xml(file_path)
-                  if not tree:
-                      return None
-                  
-                  root = tree.getroot()
-                  
-                  if format_type == "Cobertura":
+                      # Try Cobertura format
                       if 'line-rate' in root.attrib:
-                          return float(root.attrib['line-rate']) * 100
-                  
-                  elif format_type in ["JaCoCo", "Kover"]:
-                      # Find LINE counter
+                          metrics["coverage"] = round(float(root.attrib['line-rate']) * 100, 2)
+                          break
+                      
+                      # Try JaCoCo format
                       for counter in tree.findall(".//counter[@type='LINE']"):
                           if 'covered' in counter.attrib and 'missed' in counter.attrib:
                               covered = int(counter.attrib['covered'])
                               missed = int(counter.attrib['missed'])
                               total = covered + missed
                               if total > 0:
-                                  return (covered * 100.0) / total
-                  
-                  return None
-              
-              def _parse_lcov_coverage(self, file_path):
-                  """Parse LCOV coverage format"""
-                  try:
-                      with open(file_path, 'r') as f:
-                          lines_hit = 0
-                          lines_found = 0
-                          
-                          for line in f:
-                              line = line.strip()
-                              if line.startswith('LH:'):
-                                  lines_hit += int(line.split(':')[1])
-                              elif line.startswith('LF:'):
-                                  lines_found += int(line.split(':')[1])
-                          
-                          if lines_found > 0:
-                              return (lines_hit * 100.0) / lines_found
+                                  metrics["coverage"] = round((covered * 100.0) / total, 2)
+                                  break
+                      
+                      if metrics["coverage"] is not None:
+                          break
                   except Exception as e:
-                      self.log(f"Error parsing LCOV file: {e}", "ERROR")
-                  
-                  return None
-              
-              def _parse_go_text_coverage(self, file_path):
-                  """Parse Go text coverage format"""
-                  try:
-                      with open(file_path, 'r') as f:
-                          content = f.read()
-                          # Look for total coverage line
-                          patterns = [
-                              r'total:\s+\(statements\)\s+(\d+\.\d+)%',
-                              r'total:\s+.*\s+(\d+\.\d+)%',
-                              r'coverage:\s+(\d+\.\d+)%'
-                          ]
-                          
-                          for pattern in patterns:
-                              match = re.search(pattern, content)
-                              if match:
-                                  return float(match.group(1))
-                  except Exception as e:
-                      self.log(f"Error parsing Go text coverage: {e}", "ERROR")
-                  
-                  return None
-              
-              def _parse_go_out_coverage(self, file_path):
-                  """Parse Go coverage.out format by converting to text"""
-                  try:
-                      import subprocess
-                      result = subprocess.run(['go', 'tool', 'cover', '-func', file_path], 
-                                            capture_output=True, text=True, timeout=30)
-                      if result.returncode == 0:
-                          return self._parse_go_text_coverage_from_string(result.stdout)
-                  except Exception as e:
-                      self.log(f"Error parsing Go .out coverage: {e}", "ERROR")
-                  
-                  return None
-              
-              def _parse_go_text_coverage_from_string(self, content):
-                  """Parse Go coverage from string"""
-                  patterns = [
-                      r'total:\s+\(statements\)\s+(\d+\.\d+)%',
-                      r'total:\s+.*\s+(\d+\.\d+)%'
-                  ]
-                  
-                  for pattern in patterns:
-                      match = re.search(pattern, content)
+                      print(f"Error parsing coverage file {cov_file}: {e}")
+
+          # Parse Go text coverage
+          if os.path.exists("reports/coverage.txt"):
+              try:
+                  with open("reports/coverage.txt") as f:
+                      content = f.read()
+                      match = re.search(r'total:.*?(\d+\.\d+)%', content)
                       if match:
-                          return float(match.group(1))
-                  return None
-              
-              def parse_mutation_score(self):
-                  """Enhanced mutation testing score parsing"""
-                  self.log("Parsing mutation testing data")
-                  
-                  mutation_score = None
-                  
-                  # Mutation testing patterns by tool
-                  mutation_patterns = [
-                      ("PIT", ["**/pit-reports/**/mutations.xml", "**/pitreports/**/mutations.xml", 
-                              "build/reports/pitest/mutations.xml", "target/pit-reports/mutations.xml"]),
-                      ("Mull", ["**/mutations.json", "reports/mutations.json"]),
-                      ("Go Mutesting", ["reports/mutations.json", "mutations.json"]),
-                      ("Mutmut", ["**/.mutmut-cache", "**/mutmut-cache", ".mutmut-cache"])
-                  ]
-                  
-                  for tool_name, patterns in mutation_patterns:
-                      if mutation_score is not None:
-                          break
-                          
-                      for pattern in patterns:
-                          files = self.find_files(pattern)
-                          for file_path in files:
-                              if mutation_score is not None:
-                                  break
-                                  
-                              self.log(f"Checking {tool_name} file: {file_path}")
-                              
-                              try:
-                                  if tool_name == "PIT":
-                                      mutation_score = self._parse_pit_mutations(file_path)
-                                  elif tool_name == "Mull":
-                                      mutation_score = self._parse_mull_mutations(file_path)
-                                  elif tool_name == "Go Mutesting":
-                                      mutation_score = self._parse_go_mutations(file_path)
-                                  elif tool_name == "Mutmut":
-                                      mutation_score = self._parse_mutmut_database(file_path)
-                                      
-                                  if mutation_score is not None:
-                                      self.log(f"✅ Found {tool_name} mutation score: {mutation_score:.2f}%")
-                                      break
-                              except Exception as e:
-                                  self.log(f"Error parsing {tool_name} file {file_path}: {e}", "ERROR")
-                  
-                  self.metrics["mutation_score"] = round(mutation_score, 2) if mutation_score is not None else None
-                  
-                  if mutation_score is None:
-                      self.log("⚠️  No valid mutation testing data found", "WARN")
-              
-              def _parse_pit_mutations(self, file_path):
-                  """Parse PIT mutations XML"""
-                  tree = self.safe_parse_xml(file_path)
-                  if not tree:
-                      return None
-                  
-                  mutations = tree.findall(".//mutation")
-                  if not mutations:
-                      return None
-                  
-                  statuses = []
-                  for mutation in mutations:
-                      status_elem = mutation.find("status")
-                      if status_elem is not None and status_elem.text:
-                          statuses.append(status_elem.text.strip())
-                  
-                  if statuses:
-                      killed = sum(1 for s in statuses if s.upper() == "KILLED")
-                      total = len(statuses)
-                      if total > 0:
-                          return (killed * 100.0) / total
-                  
-                  return None
-              
-              def _parse_mull_mutations(self, file_path):
-                  """Parse Mull mutations JSON"""
-                  try:
-                      with open(file_path, 'r') as f:
-                          data = json.load(f)
-                          if 'mutants' in data and isinstance(data['mutants'], list):
-                              mutants = data['mutants']
-                              if mutants:
-                                  killed = sum(1 for m in mutants if m.get('status', '').upper() == 'KILLED')
-                                  total = len(mutants)
-                                  if total > 0:
-                                      return (killed * 100.0) / total
-                  except Exception as e:
-                      self.log(f"Error parsing Mull JSON: {e}", "ERROR")
-                  
-                  return None
-              
-              def _parse_go_mutations(self, file_path):
-                  """Parse Go mutation testing JSON"""
-                  try:
-                      with open(file_path, 'r') as f:
-                          content = f.read().strip()
-                          if not content:
-                              return None
-                          
-                          data = json.loads(content)
-                          if isinstance(data, list) and data:
-                              killed = sum(1 for m in data if m.get('status', '').lower() == 'killed')
-                              total = len(data)
-                              if total > 0:
-                                  return (killed * 100.0) / total
-                          elif isinstance(data, dict):
-                              # Handle different Go mutation testing formats
-                              if 'results' in data and isinstance(data['results'], list):
-                                  results = data['results']
-                                  killed = sum(1 for r in results if r.get('status', '').lower() == 'killed')
-                                  total = len(results)
-                                  if total > 0:
-                                      return (killed * 100.0) / total
-                  except Exception as e:
-                      self.log(f"Error parsing Go mutations JSON: {e}", "ERROR")
-                  
-                  return None
-              
-              def _parse_mutmut_database(self, file_path):
-                  """Parse mutmut SQLite database"""
-                  try:
-                      if not file_path.endswith('.mutmut-cache') and not file_path.endswith('mutmut-cache'):
-                          return None
-                      
-                      conn = sqlite3.connect(file_path)
-                      cursor = conn.cursor()
-                      
-                      # Check if mutant table exists
-                      cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mutant'")
-                      if not cursor.fetchone():
-                          conn.close()
-                          return None
-                      
-                      # Get mutation results
-                      cursor.execute("SELECT status, COUNT(*) FROM mutant GROUP BY status")
-                      results = cursor.fetchall()
-                      conn.close()
-                      
-                      if results:
-                          status_counts = {status: count for status, count in results}
-                          killed = status_counts.get('killed', 0)
-                          survived = status_counts.get('survived', 0)
-                          total = killed + survived
-                          
-                          if total > 0:
-                              self.log(f"Mutmut results: {killed} killed, {survived} survived")
-                              return (killed * 100.0) / total
-                      
-                  except Exception as e:
-                      self.log(f"Error parsing mutmut database: {e}", "ERROR")
-                  
-                  return None
-              
-              def parse_test_smells(self):
-                  """Enhanced test smells parsing"""
-                  self.log("Parsing test smells data")
-                  
-                  test_smells = None
-                  
-                  # Test smell file patterns
-                  smell_patterns = [
-                      "reports/test_smells.txt",
-                      "test_smells.txt",
-                      "**/test_smells*.csv",
-                      "reports/test_smells*.csv",
-                      "**/detekt*.xml",
-                      "build/reports/detekt/detekt.xml"
-                  ]
-                  
-                  for pattern in smell_patterns:
-                      files = self.find_files(pattern)
-                      for file_path in files:
-                          if test_smells is not None:
-                              break
-                          
-                          self.log(f"Checking test smells file: {file_path}")
-                          
+                          metrics["coverage"] = round(float(match.group(1)), 2)
+              except Exception as e:
+                  print(f"Error parsing Go coverage: {e}")
+
+          # Parse test smells
+          if os.path.exists("reports/test_smells.txt"):
+              try:
+                  with open("reports/test_smells.txt") as f:
+                      content = f.read().strip()
+                      if content:
                           try:
-                              if file_path.endswith('.txt'):
-                                  test_smells = self._parse_text_smells(file_path)
-                              elif file_path.endswith('.csv'):
-                                  test_smells = self._parse_csv_smells(file_path)
-                              elif file_path.endswith('.xml') and 'detekt' in file_path:
-                                  test_smells = self._parse_detekt_smells(file_path)
-                              
-                              if test_smells is not None:
-                                  self.log(f"✅ Found test smells count: {test_smells}")
-                                  break
-                          except Exception as e:
-                              self.log(f"Error parsing test smells file {file_path}: {e}", "ERROR")
-                      
-                      if test_smells is not None:
-                          break
-                  
-                  self.metrics["test_smells"] = test_smells if test_smells is not None else 0
-                  
-                  if test_smells is None:
-                      self.log("⚠️  No test smells data found, defaulting to 0", "WARN")
-              
-              def _parse_text_smells(self, file_path):
-                  """Parse text-based test smells file"""
-                  try:
-                      with open(file_path, 'r') as f:
-                          content = f.read().strip()
-                          if not content:
-                              return 0
-                          
-                          # Try to parse as number first
-                          try:
-                              return int(content.split('\n')[0].strip())
+                              metrics["test_smells"] = int(content.split('\n')[0])
                           except ValueError:
-                              # Count non-empty lines
-                              lines = [line.strip() for line in content.split('\n') if line.strip()]
-                              return len(lines)
-                  except Exception as e:
-                      self.log(f"Error parsing text smells: {e}", "ERROR")
-                  
-                  return None
-              
-              def _parse_csv_smells(self, file_path):
-                  """Parse CSV test smells file"""
-                  try:
-                      with open(file_path, 'r') as f:
-                          reader = csv.reader(f)
-                          rows = list(reader)
-                          # Subtract 1 for header row if present
-                          return max(0, len(rows) - 1) if len(rows) > 1 else 0
-                  except Exception as e:
-                      self.log(f"Error parsing CSV smells: {e}", "ERROR")
-                  
-                  return None
-              
-              def _parse_detekt_smells(self, file_path):
-                  """Parse Detekt XML for test smells"""
-                  tree = self.safe_parse_xml(file_path)
-                  if not tree:
-                      return None
-                  
-                  try:
-                      # Count error elements
-                      errors = tree.findall(".//error")
-                      return len(errors)
-                  except Exception as e:
-                      self.log(f"Error parsing Detekt XML: {e}", "ERROR")
-                  
-                  return None
-              
-              def collect_additional_metrics(self):
-                  """Collect additional metrics and metadata"""
-                  self.log("Collecting additional metrics")
-                  
-                  additional = {}
-                  
-                  try:
-                      # Count test files
-                      test_file_patterns = [
-                          "*test*.py", "test_*.py",  # Python
-                          "*Test*.java", "*test*.java",  # Java
-                          "*Test*.kt", "*test*.kt",  # Kotlin
-                          "*_test.go", "*test*.go",  # Go
-                          "*test*.cpp", "*Test*.cpp"  # C++
-                      ]
-                      
-                      total_test_files = 0
-                      for pattern in test_file_patterns:
-                          total_test_files += len(self.find_files(pattern))
-                      
-                      additional["total_test_files"] = total_test_files
-                      
-                      # Count source files
-                      source_patterns = [
-                          "*.py", "*.java", "*.kt", "*.go", "*.cpp", "*.hpp", "*.c", "*.h"
-                      ]
-                      
-                      total_source_files = 0
-                      for pattern in source_patterns:
-                          files = self.find_files(pattern)
-                          # Exclude test files
-                          source_files = [f for f in files if not any(test_word in f.lower() for test_word in ['test', 'spec'])]
-                          total_source_files += len(source_files)
-                      
-                      additional["total_source_files"] = total_source_files
-                      
-                      # Calculate test-to-source ratio
-                      if total_source_files > 0:
-                          additional["test_to_source_ratio"] = round(total_test_files / total_source_files, 2)
-                      else:
-                          additional["test_to_source_ratio"] = 0
-                      
-                      # Check for CI/CD files
-                      ci_files = [
-                          ".github/workflows/*.yml", ".github/workflows/*.yaml",
-                          ".gitlab-ci.yml", "Jenkinsfile", ".circleci/config.yml"
-                      ]
-                      
-                      has_ci = False
-                      for pattern in ci_files:
-                          if self.find_files(pattern):
-                              has_ci = True
-                              break
-                      
-                      additional["has_ci_cd"] = has_ci
-                      
-                      # Repository size metrics
-                      total_files = len(list(Path('.').rglob('*')))
-                      additional["total_files"] = total_files
-                      
-                  except Exception as e:
-                      self.log(f"Error collecting additional metrics: {e}", "ERROR")
-                  
-                  self.metrics["additional_metrics"] = additional
-              
-              def validate_metrics(self):
-                  """Validate and sanitize metrics"""
-                  self.log("Validating metrics")
-                  
-                  # Validate coverage
-                  if self.metrics["coverage"] is not None:
-                      if not (0 <= self.metrics["coverage"] <= 100):
-                          self.log(f"Invalid coverage value: {self.metrics['coverage']}, setting to None", "WARN")
-                          self.metrics["coverage"] = None
-                  
-                  # Validate mutation score
-                  if self.metrics["mutation_score"] is not None:
-                      if not (0 <= self.metrics["mutation_score"] <= 100):
-                          self.log(f"Invalid mutation score: {self.metrics['mutation_score']}, setting to None", "WARN")
-                          self.metrics["mutation_score"] = None
-                  
-                  # Validate test smells
-                  if self.metrics["test_smells"] is not None:
-                      if self.metrics["test_smells"] < 0:
-                          self.log(f"Invalid test smells count: {self.metrics['test_smells']}, setting to 0", "WARN")
-                          self.metrics["test_smells"] = 0
-              
-              def generate_summary(self):
-                  """Generate markdown summary"""
-                  self.log("Generating summary report")
-                  
-                  # Determine quality thresholds
-                  coverage = self.metrics["coverage"]
-                  mutation = self.metrics["mutation_score"]
-                  
-                  coverage_status = "N/A"
-                  mutation_status = "N/A"
-                  
-                  if coverage is not None:
-                      if coverage >= 80:
-                          coverage_status = "🟢 Excellent"
-                      elif coverage >= 60:
-                          coverage_status = "🟡 Good"
-                      elif coverage >= 40:
-                          coverage_status = "🟠 Fair"
-                      else:
-                          coverage_status = "🔴 Poor"
-                  
-                  if mutation is not None:
-                      if mutation >= 70:
-                          mutation_status = "🟢 Excellent"
-                      elif mutation >= 50:
-                          mutation_status = "🟡 Good"
-                      elif mutation >= 30:
-                          mutation_status = "🟠 Fair"
-                      else:
-                          mutation_status = "🔴 Poor"
-                  
-                  summary = f"""# 📊 Enhanced Test Metrics Report
+                              metrics["test_smells"] = len([line for line in content.split('\n') if line.strip()])
+              except Exception as e:
+                  print(f"Error parsing test smells: {e}")
+
+          # Generate summary
+          coverage_status = "N/A"
+          if metrics["coverage"] is not None:
+              if metrics["coverage"] >= 80:
+                  coverage_status = "🟢 Excellent"
+              elif metrics["coverage"] >= 60:
+                  coverage_status = "🟡 Good"
+              else:
+                  coverage_status = "🔴 Needs Improvement"
+
+          summary = f"""# 📊 Test Metrics Report
 
           ## 📋 Repository Information
-          - **Repository**: `{self.metrics['repo']}`
-          - **Pull Request**: #{self.metrics['pr_number']}
-          - **Language**: {self.metrics['language'].title()}
-          - **Timestamp**: {self.metrics['timestamp']}
+          - **Repository**: `{metrics['repo']}`
+          - **Pull Request**: #{metrics['pr_number']}
+          - **Language**: {metrics['language'].title()}
 
-          ## 🏗️ Build & Execution Status
-          - **Compilation**: {'✅ Success' if self.metrics['compilation_success'] else '❌ Failed'}
-          - **Test Execution**: {'✅ Success' if self.metrics['execution_success'] else '❌ Failed'}
+          ## 🏗️ Build Status
+          - **Compilation**: {'✅ Success' if metrics['compilation_success'] else '❌ Failed'}
+          - **Test Execution**: {'✅ Success' if metrics['execution_success'] else '❌ Failed' if metrics['execution_success'] is False else '⚠️ No Tests Found'}
 
           ## 📈 Code Quality Metrics
-          | Metric | Value | Status |
-          |--------|-------|--------|
-          | **Code Coverage** | {f"{coverage}%" if coverage is not None else 'N/A'} | {coverage_status} |
-          | **Mutation Score** | {f"{mutation}%" if mutation is not None else 'N/A'} | {mutation_status} |
-          | **Test Smells** | {self.metrics['test_smells']} | {'🟢 Low' if self.metrics['test_smells'] <= 5 else '🟡 Medium' if self.metrics['test_smells'] <= 15 else '🔴 High'} |
+          - **Code Coverage**: {f"{metrics['coverage']}%" if metrics['coverage'] is not None else 'N/A'} ({coverage_status})
+          - **Test Smells**: {metrics['test_smells']}
 
-          ## 📊 Additional Metrics
+          ## 🎯 Recommendations
           """
-                  
-                  if self.metrics["additional_metrics"]:
-                      additional = self.metrics["additional_metrics"]
-                      summary += f"""
-          - **Total Test Files**: {additional.get('total_test_files', 'N/A')}
-          - **Total Source Files**: {additional.get('total_source_files', 'N/A')}
-          - **Test-to-Source Ratio**: {additional.get('test_to_source_ratio', 'N/A')}
-          - **Has CI/CD**: {'✅ Yes' if additional.get('has_ci_cd', False) else '❌ No'}
-          """
-                  
-                  summary += f"""
-          ## 🎯 Quality Assessment
 
-          ### Coverage Analysis
-          - 🟢 **Excellent (≥80%)**: Comprehensive test coverage
-          - 🟡 **Good (60-79%)**: Adequate test coverage
-          - 🟠 **Fair (40-59%)**: Needs improvement
-          - 🔴 **Poor (<40%)**: Insufficient coverage
-
-          ### Mutation Testing Analysis
-          - 🟢 **Excellent (≥70%)**: High-quality tests that catch mutations
-          - 🟡 **Good (50-69%)**: Reasonable mutation detection
-          - 🟠 **Fair (30-49%)**: Moderate test effectiveness
-          - 🔴 **Poor (<30%)**: Weak test suite
-
-          ### Test Smell Analysis
-          - 🟢 **Low (≤5)**: Clean test code
-          - 🟡 **Medium (6-15)**: Some test code issues
-          - 🔴 **High (>15)**: Significant test code problems
-
-          ## 🚀 Recommendations
-
-          """
-                  
-                  # Add specific recommendations
-                  recommendations = []
-                  
-                  if not self.metrics["compilation_success"]:
-                      recommendations.append("🔧 **Fix compilation errors** - Ensure code compiles successfully")
-                  
-                  if not self.metrics["execution_success"]:
-                      recommendations.append("🧪 **Fix failing tests** - Address test failures before proceeding")
-                  
-                  if coverage is not None and coverage < 60:
-                      recommendations.append("📊 **Improve test coverage** - Add more comprehensive tests")
-                  
-                  if mutation is not None and mutation < 50:
-                      recommendations.append("🎯 **Enhance test quality** - Write tests that better detect code changes")
-                  
-                  if self.metrics["test_smells"] > 10:
-                      recommendations.append("🧹 **Reduce test smells** - Refactor test code for better maintainability")
-                  
-                  if not recommendations:
-                      recommendations.append("🎉 **Great job!** - Your code quality metrics look good")
-                  
-                  for i, rec in enumerate(recommendations, 1):
-                      summary += f"{i}. {rec}\n"
-                  
-                  summary += f"""
-          ---
-          *Report generated by Enhanced Test Metrics Workflow v4*  
-          *Workflow Run: {self.metrics['workflow_run']}*
-          """
-                  
-                  return summary
-              
-              def save_results(self):
-                  """Save results to files"""
-                  self.log("Saving results to files")
-                  
-                  # Ensure reports directory exists
-                  os.makedirs("reports", exist_ok=True)
-                  
-                  try:
-                      # Save JSON metrics
-                      with open("reports/metrics.json", "w") as f:
-                          json.dump(self.metrics, f, indent=2, sort_keys=True)
-                      
-                      # Save markdown summary
-                      summary = self.generate_summary()
-                      with open("reports/metrics_summary.md", "w") as f:
-                          f.write(summary)
-                      
-                      # Save CSV for easy analysis
-                      csv_data = {
-                          "repo": self.metrics["repo"],
-                          "pr_number": self.metrics["pr_number"],
-                          "language": self.metrics["language"],
-                          "coverage": self.metrics["coverage"],
-                          "mutation_score": self.metrics["mutation_score"],
-                          "compilation_success": self.metrics["compilation_success"],
-                          "execution_success": self.metrics["execution_success"],
-                          "test_smells": self.metrics["test_smells"],
-                          "timestamp": self.metrics["timestamp"]
-                      }
-                      
-                      with open("reports/metrics.csv", "w", newline='') as f:
-                          writer = csv.DictWriter(f, fieldnames=csv_data.keys())
-                          writer.writeheader()
-                          writer.writerow(csv_data)
-                      
-                      self.log("✅ Results saved successfully")
-                      
-                  except Exception as e:
-                      self.log(f"Error saving results: {e}", "ERROR")
-              
-              def run(self):
-                  """Run the complete metrics parsing pipeline"""
-                  try:
-                      self.log("=== Starting Enhanced Metrics Parsing ===")
-                      
-                      self.parse_build_status()
-                      self.parse_coverage()
-                      self.parse_mutation_score()
-                      self.parse_test_smells()
-                      self.collect_additional_metrics()
-                      self.validate_metrics()
-                      self.save_results()
-                      
-                      self.log("=== Metrics Parsing Complete ===")
-                      
-                      # Print final summary
-                      print("\n" + "="*60)
-                      print("FINAL METRICS SUMMARY")
-                      print("="*60)
-                      print(f"Repository: {self.metrics['repo']}")
-                      print(f"PR Number: {self.metrics['pr_number']}")
-                      print(f"Language: {self.metrics['language']}")
-                      print(f"Build Success: {self.metrics['compilation_success']}")
-                      print(f"Test Success: {self.metrics['execution_success']}")
-                      print(f"Coverage: {self.metrics['coverage']}%" if self.metrics['coverage'] is not None else "Coverage: N/A")
-                      print(f"Mutation Score: {self.metrics['mutation_score']}%" if self.metrics['mutation_score'] is not None else "Mutation Score: N/A")
-                      print(f"Test Smells: {self.metrics['test_smells']}")
-                      print("="*60)
-                      
-                      # Return appropriate exit code
-                      if not self.metrics["compilation_success"]:
-                          self.log("Exiting with code 1: Build failed", "ERROR")
-                          return 1
-                      elif not self.metrics["execution_success"]:
-                          self.log("Exiting with code 2: Tests failed", "ERROR")
-                          return 2
-                      else:
-                          self.log("Exiting with code 0: Success")
-                          return 0
-                          
-                  except Exception as e:
-                      self.log(f"Critical error in metrics parsing: {e}", "ERROR")
-                      self.log(traceback.format_exc(), "ERROR")
-                      return 3
-
-          # Run the metrics parser
-          if __name__ == "__main__":
-              parser = MetricsParser()
-              exit_code = parser.run()
-              sys.exit(exit_code)
-          METRICS_EOF
-
-      # =======================
-      # Enhanced Artifact Management
-      # =======================
-      - name: Prepare artifacts with cleanup
-        if: always()
-        run: |
-          source utils.sh
+          recommendations = []
+          if not metrics["compilation_success"]:
+              recommendations.append("🔧 **Fix compilation errors** - Code must compile successfully")
+          if metrics["execution_success"] is False:
+              recommendations.append("🧪 **Fix failing tests** - Address test failures")
+          if metrics["coverage"] is not None and metrics["coverage"] < 60:
+              recommendations.append("📊 **Improve test coverage** - Aim for at least 60% coverage")
+          if metrics["test_smells"] > 10:
+              recommendations.append("🧹 **Reduce test smells** - Refactor test code")
           
-          log_info "Preparing artifacts for upload"
-          
-          # Create organized artifact structure
-          mkdir -p artifacts/{logs,reports,raw_data,summaries}
-          
-          # Copy logs with size limits (max 10MB per file)
-          for log_file in logs/*.log logs/*.txt; do
-            if [ -f "$log_file" ]; then
-              file_size=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
-              if [ "$file_size" -gt 10485760 ]; then
-                # Truncate large files
-                tail -c 10485760 "$log_file" > "artifacts/logs/$(basename "$log_file")"
-                echo "[TRUNCATED - Original size: $file_size bytes]" | cat - "artifacts/logs/$(basename "$log_file")" > temp && mv temp "artifacts/logs/$(basename "$log_file")"
-              else
-                cp "$log_file" "artifacts/logs/"
-              fi
-            fi
-          done
-          
-          # Copy reports
-          find reports -type f \( -name "*.xml" -o -name "*.json" -o -name "*.html" -o -name "*.txt" -o -name "*.csv" \) -exec cp {} artifacts/reports/ \; 2>/dev/null || true
-          
-          # Copy coverage files
-          find . -maxdepth 2 -name "coverage.*" -type f -exec cp {} artifacts/raw_data/ \; 2>/dev/null || true
-          
-          # Copy main summary files
-          cp reports/metrics*.* artifacts/summaries/ 2>/dev/null || true
-          
-          # Generate artifact index
-          cat > artifacts/README.md << 'ARTIFACT_README'
-          # Test Metrics Artifacts
+          if not recommendations:
+              recommendations.append("🎉 **Great job!** - Your code quality metrics look good")
 
-          ## Directory Structure
+          for i, rec in enumerate(recommendations, 1):
+              summary += f"{i}. {rec}\n"
 
-          - **logs/**: Build, test, and tool execution logs
-          - **reports/**: Generated reports (coverage, mutations, test smells)  
-          - **raw_data/**: Raw data files (coverage.out, etc.)
-          - **summaries/**: Final metric summaries and analysis
-
-          ## Key Files
-
-          - `summaries/metrics.json`: Complete metrics in JSON format
-          - `summaries/metrics_summary.md`: Human-readable summary
-          - `summaries/metrics.csv`: Metrics in CSV format
-          - `reports/coverage.*`: Coverage reports
-          - `reports/mutations.*`: Mutation testing results
-
-          ## Notes
-
-          - Log files larger than 10MB have been truncated
-          - Timestamps are in ISO format
-          - Exit codes: 0=Success, 1=Build Failed, 2=Tests Failed, 3=Parsing Error
-          ARTIFACT_README
+          # Save results
+          os.makedirs("final_reports", exist_ok=True)
           
-          # Show artifact summary
-          log_info "Artifact summary:"
-          find artifacts -type f | wc -l | xargs echo "Total files:"
-          du -sh artifacts | cut -f1 | xargs echo "Total size:"
+          with open("final_reports/metrics.json", "w") as f:
+              json.dump(metrics, f, indent=2)
           
-          cleanup_temp
-          
-          log_info "Artifacts prepared successfully"
+          with open("final_reports/summary.md", "w") as f:
+              f.write(summary)
 
-      - name: Upload comprehensive artifacts
+          print("=== FINAL METRICS ===")
+          print(json.dumps(metrics, indent=2))
+          print("=" * 50)
+
+          # Exit with appropriate code
+          if not metrics["compilation_success"]:
+              exit(1)
+          elif metrics["execution_success"] is False:
+              exit(2)
+          else:
+              exit(0)
+          EOF
+
+      - name: Upload final metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-metrics-${{ github.event.inputs.language }}-${{ github.event.inputs.pr_number }}-${{ github.run_number }}
-          path: artifacts/
-          retention-days: 30
-          compression-level: 6
-
-      - name: Upload metrics summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics-summary-${{ github.event.inputs.language }}-${{ github.event.inputs.pr_number }}
+          name: final-metrics-${{ github.event.inputs.language }}-${{ github.event.inputs.pr_number }}
           path: |
-            reports/metrics.json
-            reports/metrics_summary.md
-            reports/metrics.csv
+            final_reports/
+            logs/
+            reports/
           retention-days: 90
 
-      # =======================
-      # Enhanced Job Summary
-      # =======================
-      - name: Generate enhanced job summary
+      - name: Generate job summary
         if: always()
         run: |
-          source utils.sh
-          
-          log_info "Generating enhanced job summary"
-          
-          # Start with basic info
-          echo "# 🚀 Enhanced Test Metrics Workflow Results" >> $GITHUB_STEP_SUMMARY
+          echo "# 🚀 Test Metrics Workflow Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Repository:** \`${{ github.event.inputs.repo }}\`" >> $GITHUB_STEP_SUMMARY  
+          echo "**Repository:** \`${{ github.event.inputs.repo }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**PR Number:** #${{ github.event.inputs.pr_number }}" >> $GITHUB_STEP_SUMMARY
           echo "**Language:** ${{ github.event.inputs.language }}" >> $GITHUB_STEP_SUMMARY
           echo "**Workflow Run:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Add main summary if available
-          if [ -f "reports/metrics_summary.md" ]; then
-            cat reports/metrics_summary.md >> $GITHUB_STEP_SUMMARY
+          if [ -f "final_reports/summary.md" ]; then
+            cat final_reports/summary.md >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️ **Metrics summary not available**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The workflow completed but no metrics summary was generated." >> $GITHUB_STEP_SUMMARY
-            echo "This may indicate issues during the build or test execution phase." >> $GITHUB_STEP_SUMMARY
+            echo "The workflow may have encountered issues during execution." >> $GITHUB_STEP_SUMMARY
+            echo "Please check the individual job logs for more details:" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Please check the workflow logs and uploaded artifacts for more details." >> $GITHUB_STEP_SUMMARY
+            echo "- 🔍 [Setup Jobs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+            echo "- 🧪 [Test Execution](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+            echo "- 📊 [Metrics Parsing](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
           fi
           
-          # Add quick links
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- 📊 [View Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
-          echo "- 🔍 [Pull Request](https://github.com/${{ github.event.inputs.repo }}/pull/${{ github.event.inputs.pr_number }})" >> $GITHUB_STEP_SUMMARY
-          echo "- 📋 [Workflow Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
-
-      # =======================
-      # Cleanup and Finalization  
-      # =======================
-      - name: Final cleanup and status
-        if: always()
-        run: |
-          source utils.sh
-          
-          log_info "Performing final cleanup"
-          
-          # Clean up temporary files
-          cleanup_temp
-          rm -rf venv 2>/dev/null || true
-          rm -rf build 2>/dev/null || true
-          rm -rf .gradle 2>/dev/null || true
-          rm -rf target 2>/dev/null || true
-          rm -rf node_modules 2>/dev/null || true
-          
-          # Show final disk usage
-          df -h . || true
-          
-          # Show memory usage
-          free -h || true
-          
-          # Determine final exit code
-          EXIT_CODE=0
-          
-          if [ -f "reports/metrics.json" ]; then
-            # Extract success status from metrics
-            BUILD_SUCCESS=$(python3 -c "
-          import json
-          try:
-              with open('reports/metrics.json', 'r') as f:
-                  data = json.load(f)
-                  print(str(data.get('compilation_success', True)).lower())
-          except:
-              print('true')
-          " 2>/dev/null || echo "true")
-            
-            TEST_SUCCESS=$(python3 -c "
-          import json
-          try:
-              with open('reports/metrics.json', 'r') as f:
-                  data = json.load(f)
-                  print(str(data.get('execution_success', True)).lower())
-          except:
-              print('true')
-          " 2>/dev/null || echo "true")
-            
-            if [ "$BUILD_SUCCESS" = "false" ]; then
-              EXIT_CODE=1
-              log_error "❌ Workflow failed: Build compilation failed"
-            elif [ "$TEST_SUCCESS" = "false" ]; then
-              EXIT_CODE=2
-              log_warn "⚠️  Workflow completed with test failures"
-            else
-              log_info "✅ Workflow completed successfully"
-            fi
-          else
-            EXIT_CODE=3
-            log_error "❌ Workflow failed: No metrics generated"
-          fi
-          
-          log_info "Final exit code: $EXIT_CODE"
-          
-          # Set outputs for potential downstream jobs
-          echo "build_success=$BUILD_SUCCESS" >> $GITHUB_OUTPUT
-          echo "test_success=$TEST_SUCCESS" >> $GITHUB_OUTPUT
-          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          
-          exit $EXIT_CODE
+          echo "- 📊 [Download All Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔍 [View Pull Request](https://github.com/${{ github.event.inputs.repo }}/pull/${{ github.event.inputs.pr_number }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 📋 [Workflow Source](https://github.com/${{ github.repository }}/blob/main/.github/workflows/)" >> $GITHUB_STEP_SUMMARY
