@@ -112,8 +112,8 @@ jobs:
           echo "### Mutation Testing" >> $GITHUB_STEP_SUMMARY
           # Check if Python files exist for mutation (excluding tests)
           if find . -name "*.py" -not -path "./tests/*" | grep -q .; then
-            # Run mutmut with limited scope and sampling to reduce runtime
-            mutmut run --paths-to-mutate . --runner "pytest tests/" --test-time-multiplier 2.0 --max-mutants 100 > mut_output.txt 2>&1 || true
+            # Run mutmut with specific test directory to reduce runtime
+            mutmut run --paths-to-mutate . --tests-dir tests/ --test-time-multiplier 2.0 > mut_output.txt 2>&1 || true
             cat mut_output.txt >> $GITHUB_STEP_SUMMARY
             # Extract mutation score (e.g., "10/12  🎉" means 10 killed out of 12 mutants)
             final_line=$(grep -E '[0-9]+/[0-9]+.*🎉' mut_output.txt | tail -1)
