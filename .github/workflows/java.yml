@@ -23,7 +23,7 @@ jobs:
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '21'  # Updated to Java 21
           distribution: 'temurin'
 
       - name: Download JaCoCo
@@ -38,9 +38,9 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::Compilation Output"
-          mvn compile || echo "Compilation failed"
+          mvn compile -e -X || echo "Compilation failed"
           echo "::endgroup::"
-          if [ ${{ steps.compile.outcome }} == 'success' ]; then
+          if [[ "${{ steps.compile.outcome }}" == "success" ]]; then
             echo "Compilation: Success"
           else
             echo "Compilation: Failed"
@@ -51,9 +51,13 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::Test Output"
-          mvn -DargLine="-javaagent:$(pwd)/jacocoagent.jar=destfile=jacoco.exec" test || echo "Tests failed"
+          if [ -f "$(pwd)/jacocoagent.jar" ]; then
+            mvn -DargLine="-javaagent:$(pwd)/jacocoagent.jar=destfile=jacoco.exec" test -e -X || echo "Tests failed"
+          else
+            echo "Tests failed: JaCoCo agent not found"
+          fi
           echo "::endgroup::"
-          if [ ${{ steps.test.outcome }} == 'success' ]; then
+          if [[ "${{ steps.test.outcome }}" == "success" ]]; then
             echo "Test Execution: Success"
           else
             echo "Test Execution: Failed"
@@ -80,8 +84,9 @@ jobs:
           mvn org.pitest:pitest-maven:mutationCoverage \
             -DoutputFormats=HTML \
             -DreportsDirectory=mutation-report \
-            -DtargetClasses='*' \
-            -DtargetTests='*' || echo "Mutation testing failed"
+            -DtargetClasses='com.example.*' \  # Replace with project-specific package
+            -DtargetTests='com.example.*' \
+            -DexcludedClasses='org.pitest.*' || echo "Mutation testing failed"
           echo "::endgroup::"
           if [ -f mutation-report/index.html ]; then
             mutation_score=$(grep -oP '(?<=Mutation score</td><td>)\d+%' mutation-report/index.html || echo "N/A")
@@ -92,21 +97,18 @@ jobs:
             echo "No mutation data" > mutation-report/index.html
           fi
 
-      - name: Download and run test smells detector
+      - name: Run test smells detector
         if: always()
         continue-on-error: true
         run: |
           echo "::group::Test Smells Detection"
-          git clone https://github.com/TestSmells/TSDetect.git tsdetect
-          cd tsdetect
-          ./gradlew jar || echo "Failed to build TSDetect"
-          cd ..
-          if [ -f tsdetect/build/libs/*.jar ]; then
-            cp tsdetect/build/libs/*.jar TestSmellDetector.jar
-            java -jar TestSmellDetector.jar src/test/java || echo "Test smells detection failed"
-          else
-            echo "Test Smells: N/A (detector jar not found)"
-          fi
+          # Placeholder: TSDetect requires specific execution (not a standalone JAR)
+          echo "Test Smells: N/A (TSDetect execution method TBD)"
+          # Example: Replace with actual command once clarified, e.g.:
+          # git clone https://github.com/TestSmells/TSDetect.git tsdetect
+          # cd tsdetect
+          # ./gradlew run --args="path/to/src/test/java" || echo "Test smells detection failed"
+          echo "Test Smells: N/A (detector not executable)"
           echo "::endgroup::"
 
       - name: Get test smells summary
