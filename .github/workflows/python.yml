@@ -1,192 +1,533 @@
-name: Test External PR
+name: External Python PR Analysis
 
 on:
   workflow_dispatch:
     inputs:
-      repository:
-        description: 'Repository name in the format owner/repo'
+      repo_name:
+        description: 'Repository name (owner/repo)'
         required: true
+        type: string
+        default: 'example/python-project'
       pr_number:
         description: 'Pull Request number'
         required: true
+        type: string
+        default: '1'
+      python_version:
+        description: 'Python version to use'
+        required: false
+        type: choice
+        default: '3.9'
+        options:
+          - '3.8'
+          - '3.9'
+          - '3.10'
+          - '3.11'
+          - '3.12'
+
+env:
+  REPO_NAME: ${{ github.event.inputs.repo_name }}
+  PR_NUMBER: ${{ github.event.inputs.pr_number }}
+  PYTHON_VERSION: ${{ github.event.inputs.python_version }}
 
 jobs:
-  analyze:
+  analyze-pr:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
     steps:
-      # Checkout the PR code from the specified external repository and PR number
-      - name: Checkout PR code
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.repository }}
-          ref: refs/pull/${{ inputs.pr_number }}/head
-          fetch-depth: 0 # Fetch full history for git diff
-
-      # Set up Python environment with version 3.12
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      # Install project dependencies and required testing tools
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          # Install project dependencies if files exist
-          for req_file in requirements.txt test-requirements.txt requirements-dev.txt; do
-            if [ -f "$req_file" ]; then
-              pip install -r "$req_file" || echo "Failed to install $req_file" >> $GITHUB_STEP_SUMMARY
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git curl jq
+    
+    - name: Get PR information
+      id: pr_info
+      run: |
+        echo "Getting PR information for $REPO_NAME #$PR_NUMBER"
+        
+        # Get PR details using GitHub API
+        PR_DATA=$(curl -s -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$REPO_NAME/pulls/$PR_NUMBER")
+        
+        # Extract relevant information
+        HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+        HEAD_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
+        BASE_SHA=$(echo "$PR_DATA" | jq -r '.base.sha')
+        BASE_REF=$(echo "$PR_DATA" | jq -r '.base.ref')
+        CLONE_URL=$(echo "$PR_DATA" | jq -r '.head.repo.clone_url')
+        
+        echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+        echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
+        echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
+        echo "base_ref=$BASE_REF" >> $GITHUB_OUTPUT
+        echo "clone_url=$CLONE_URL" >> $GITHUB_OUTPUT
+        
+        # Check if PR exists
+        if [ "$HEAD_SHA" = "null" ]; then
+          echo "❌ PR #$PR_NUMBER not found in repository $REPO_NAME"
+          exit 1
+        fi
+        
+        echo "✅ Found PR #$PR_NUMBER: $HEAD_SHA"
+    
+    - name: Clone repository and checkout PR
+      run: |
+        echo "Cloning repository: $REPO_NAME"
+        git clone ${{ steps.pr_info.outputs.clone_url }} repo
+        cd repo
+        
+        # Checkout the PR branch
+        git fetch origin pull/$PR_NUMBER/head:pr-branch
+        git checkout pr-branch
+        
+        echo "✅ Checked out PR branch: ${{ steps.pr_info.outputs.head_ref }}"
+        echo "Current commit: $(git rev-parse HEAD)"
+    
+    - name: Detect Python project structure
+      id: project_info
+      run: |
+        cd repo
+        
+        # Check for common Python project files
+        HAS_REQUIREMENTS=false
+        HAS_SETUP_PY=false
+        HAS_PYPROJECT=false
+        HAS_PIPFILE=false
+        TEST_FRAMEWORK="unknown"
+        
+        if [ -f "requirements.txt" ]; then
+          HAS_REQUIREMENTS=true
+        fi
+        
+        if [ -f "setup.py" ]; then
+          HAS_SETUP_PY=true
+        fi
+        
+        if [ -f "pyproject.toml" ]; then
+          HAS_PYPROJECT=true
+        fi
+        
+        if [ -f "Pipfile" ]; then
+          HAS_PIPFILE=true
+        fi
+        
+        # Detect test framework
+        if grep -r "import pytest" . --include="*.py" 2>/dev/null || \
+           grep -r "from pytest" . --include="*.py" 2>/dev/null || \
+           [ -f "pytest.ini" ] || [ -f ".pytest_cache" ]; then
+          TEST_FRAMEWORK="pytest"
+        elif grep -r "import unittest" . --include="*.py" 2>/dev/null || \
+             grep -r "from unittest" . --include="*.py" 2>/dev/null; then
+          TEST_FRAMEWORK="unittest"
+        elif grep -r "import nose" . --include="*.py" 2>/dev/null; then
+          TEST_FRAMEWORK="nose"
+        fi
+        
+        echo "has_requirements=$HAS_REQUIREMENTS" >> $GITHUB_OUTPUT
+        echo "has_setup_py=$HAS_SETUP_PY" >> $GITHUB_OUTPUT
+        echo "has_pyproject=$HAS_PYPROJECT" >> $GITHUB_OUTPUT
+        echo "has_pipfile=$HAS_PIPFILE" >> $GITHUB_OUTPUT
+        echo "test_framework=$TEST_FRAMEWORK" >> $GITHUB_OUTPUT
+        
+        echo "📋 Project Analysis:"
+        echo "  - Requirements.txt: $HAS_REQUIREMENTS"
+        echo "  - Setup.py: $HAS_SETUP_PY"
+        echo "  - Pyproject.toml: $HAS_PYPROJECT"
+        echo "  - Pipfile: $HAS_PIPFILE"
+        echo "  - Test Framework: $TEST_FRAMEWORK"
+    
+    - name: Install dependencies
+      run: |
+        cd repo
+        
+        # Upgrade pip
+        python -m pip install --upgrade pip
+        
+        # Install analysis tools
+        pip install coverage pytest pytest-cov mutmut pylint flake8 radon bandit safety
+        
+        # Install project dependencies based on what's available
+        if [ "${{ steps.project_info.outputs.has_requirements }}" = "true" ]; then
+          echo "Installing from requirements.txt"
+          pip install -r requirements.txt
+        fi
+        
+        if [ "${{ steps.project_info.outputs.has_setup_py }}" = "true" ]; then
+          echo "Installing from setup.py"
+          pip install -e .
+        fi
+        
+        if [ "${{ steps.project_info.outputs.has_pyproject }}" = "true" ]; then
+          echo "Installing from pyproject.toml"
+          pip install -e .
+        fi
+        
+        if [ "${{ steps.project_info.outputs.has_pipfile }}" = "true" ]; then
+          echo "Installing pipenv and dependencies"
+          pip install pipenv
+          pipenv install --dev --system
+        fi
+    
+    - name: Check compilation/syntax
+      id: compilation
+      continue-on-error: true
+      run: |
+        cd repo
+        echo "🔍 Checking Python syntax and compilation..."
+        
+        COMPILATION_SUCCESS=true
+        SYNTAX_ERRORS=""
+        
+        # Check all Python files for syntax errors
+        while IFS= read -r -d '' file; do
+          if ! python -m py_compile "$file" 2>/dev/null; then
+            COMPILATION_SUCCESS=false
+            ERROR=$(python -m py_compile "$file" 2>&1 || true)
+            SYNTAX_ERRORS="$SYNTAX_ERRORS\n- $file: $ERROR"
+          fi
+        done < <(find . -name "*.py" -print0)
+        
+        echo "compilation_success=$COMPILATION_SUCCESS" >> $GITHUB_OUTPUT
+        echo "syntax_errors<<EOF" >> $GITHUB_OUTPUT
+        echo -e "$SYNTAX_ERRORS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        if [ "$COMPILATION_SUCCESS" = "true" ]; then
+          echo "✅ All Python files compile successfully"
+        else
+          echo "❌ Compilation errors found"
+        fi
+    
+    - name: Run tests with coverage
+      id: tests
+      continue-on-error: true
+      run: |
+        cd repo
+        echo "🧪 Running tests with coverage..."
+        
+        TEST_SUCCESS=false
+        COVERAGE_PERCENTAGE=0
+        TEST_OUTPUT=""
+        
+        if [ "${{ steps.project_info.outputs.test_framework }}" = "pytest" ]; then
+          echo "Running pytest with coverage..."
+          if pytest --cov=. --cov-report=term-missing --cov-report=xml --junitxml=test-results.xml -v > test_output.txt 2>&1; then
+            TEST_SUCCESS=true
+          fi
+        elif [ "${{ steps.project_info.outputs.test_framework }}" = "unittest" ]; then
+          echo "Running unittest with coverage..."
+          if coverage run -m unittest discover -v > test_output.txt 2>&1; then
+            TEST_SUCCESS=true
+            coverage xml
+          fi
+        else
+          echo "Attempting to discover and run tests..."
+          # Try pytest first, then unittest
+          if pytest --cov=. --cov-report=term-missing --cov-report=xml --junitxml=test-results.xml -v > test_output.txt 2>&1; then
+            TEST_SUCCESS=true
+          elif python -m unittest discover -v > test_output.txt 2>&1; then
+            TEST_SUCCESS=true
+            coverage run -m unittest discover
+            coverage xml
+          fi
+        fi
+        
+        # Extract coverage percentage
+        if [ -f "coverage.xml" ]; then
+          COVERAGE_PERCENTAGE=$(python -c "
+import xml.etree.ElementTree as ET
+try:
+    tree = ET.parse('coverage.xml')
+    root = tree.getroot()
+    coverage = root.get('line-rate', '0')
+    print(int(float(coverage) * 100))
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+        fi
+        
+        TEST_OUTPUT=$(cat test_output.txt 2>/dev/null || echo "No test output available")
+        
+        echo "test_success=$TEST_SUCCESS" >> $GITHUB_OUTPUT
+        echo "coverage_percentage=$COVERAGE_PERCENTAGE" >> $GITHUB_OUTPUT
+        echo "test_output<<EOF" >> $GITHUB_OUTPUT
+        echo "$TEST_OUTPUT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "Tests completed: Success=$TEST_SUCCESS, Coverage=$COVERAGE_PERCENTAGE%"
+    
+    - name: Run mutation testing
+      id: mutation
+      continue-on-error: true
+      run: |
+        cd repo
+        echo "🧬 Running mutation testing with mutmut..."
+        
+        MUTATION_SCORE=0
+        MUTATION_OUTPUT=""
+        
+        # Run mutmut (limit to prevent long execution)
+        timeout 300 mutmut run --paths-to-mutate=. 2>&1 | tee mutation_output.txt || true
+        
+        # Get mutation score
+        if mutmut results > mutation_results.txt 2>/dev/null; then
+          MUTATION_SCORE=$(grep -o "mutation score [0-9.]*%" mutation_results.txt | grep -o "[0-9.]*" | head -1 || echo "0")
+        fi
+        
+        MUTATION_OUTPUT=$(cat mutation_output.txt 2>/dev/null | head -20 || echo "Mutation testing completed with timeout or error")
+        
+        echo "mutation_score=$MUTATION_SCORE" >> $GITHUB_OUTPUT
+        echo "mutation_output<<EOF" >> $GITHUB_OUTPUT
+        echo "$MUTATION_OUTPUT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "Mutation testing completed: Score=$MUTATION_SCORE%"
+    
+    - name: Analyze test smells
+      id: test_smells
+      continue-on-error: true
+      run: |
+        cd repo
+        echo "👃 Analyzing test smells..."
+        
+        TEST_SMELLS=""
+        SMELL_COUNT=0
+        
+        # Find test files
+        TEST_FILES=$(find . -name "*test*.py" -o -name "test_*.py" -o -path "*/tests/*" -name "*.py" | head -20)
+        
+        if [ -z "$TEST_FILES" ]; then
+          echo "No test files found"
+          TEST_SMELLS="No test files found for analysis"
+        else
+          # Check for common test smells
+          for file in $TEST_FILES; do
+            if [ -f "$file" ]; then
+              # Long test methods (>50 lines)
+              LONG_TESTS=$(awk '/def test_/{start=NR} /^def |^class |^$/{if(start && NR-start>50){print FILENAME":"start":"$0} start=0}' "$file" | wc -l)
+              
+              # Duplicate assertions
+              DUP_ASSERTS=$(grep -n "assert" "$file" | cut -d: -f2- | sort | uniq -d | wc -l)
+              
+              # Magic numbers in tests
+              MAGIC_NUMS=$(grep -n "[^a-zA-Z_][0-9][0-9][0-9]" "$file" | wc -l)
+              
+              if [ $LONG_TESTS -gt 0 ]; then
+                TEST_SMELLS="$TEST_SMELLS\n- $file: $LONG_TESTS long test methods (>50 lines)"
+                SMELL_COUNT=$((SMELL_COUNT + LONG_TESTS))
+              fi
+              
+              if [ $DUP_ASSERTS -gt 0 ]; then
+                TEST_SMELLS="$TEST_SMELLS\n- $file: $DUP_ASSERTS duplicate assertions found"
+                SMELL_COUNT=$((SMELL_COUNT + DUP_ASSERTS))
+              fi
+              
+              if [ $MAGIC_NUMS -gt 0 ]; then
+                TEST_SMELLS="$TEST_SMELLS\n- $file: $MAGIC_NUMS potential magic numbers"
+                SMELL_COUNT=$((SMELL_COUNT + MAGIC_NUMS))
+              fi
             fi
           done
-          # Install testing tools, prefer mutmut>=2.5.0 with fallback
-          pip install pytest pytest-cov==4.1.0 mutmut==2.5.0 flake8 pytest-asyncio || pip install pytest pytest-cov==4.1.0 mutmut==2.4.0 flake8 pytest-asyncio || { echo "Failed to install testing tools" >> $GITHUB_STEP_SUMMARY; exit 1; }
-
-      # Create a .coveragerc file to exclude non-Python files and directories
-      - name: Configure coverage
-        run: |
-          echo "[run]" > .coveragerc
-          echo "source = ." >> .coveragerc
-          echo "omit =" >> .coveragerc
-          echo "  *.html" >> .coveragerc
-          echo "  *.md" >> .coveragerc
-          echo "  *.json" >> .coveragerc
-          echo "  *.yaml" >> .coveragerc
-          echo "  templates/*" >> .coveragerc
-          echo "  tests/*" >> .coveragerc
-          echo "  docs/*" >> .coveragerc
-          echo "  examples/*" >> .coveragerc
-          echo "  scripts/*" >> .coveragerc
-
-      # Check for syntax errors in Python code
-      - name: Compilation check (syntax validation)
-        id: compilation
-        continue-on-error: true
-        run: |
-          echo "### Compilation Check" >> $GITHUB_STEP_SUMMARY
-          if find . -name "*.py" | grep -q .; then
-            python -m compileall -q . > comp_output.txt 2>&1
-            comp_exit=$?
-            cat comp_output.txt >> $GITHUB_STEP_SUMMARY
-            if [ $comp_exit -eq 0 ]; then
-              echo "status=Success" >> $GITHUB_OUTPUT
-              echo "Success: No syntax errors." >> $GITHUB_STEP_SUMMARY
-            else
-              echo "status=Failure" >> $GITHUB_OUTPUT
-              echo "Failure: Syntax errors found. See details above." >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "status=Failure" >> $GITHUB_OUTPUT
-            echo "Failure: No Python files found." >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # Run tests and calculate code coverage
-      - name: Run tests with coverage
-        id: tests
-        continue-on-error: true
-        timeout-minutes: 10
-        run: |
-          echo "### Test Execution and Coverage" >> $GITHUB_STEP_SUMMARY
-          pytest --cov=. --cov-report=term --cov-config=.coveragerc --disable-pytest-warnings > test_output.txt 2>&1 || true
-          cat test_output.txt >> $GITHUB_STEP_SUMMARY
-
-          cov_line=$(grep "TOTAL" test_output.txt | tail -1 | awk '{print $(NF)}' | sed 's/%//')
-          if [ -n "$cov_line" ] && [[ "$cov_line" =~ ^[0-9]+$ ]]; then
-            echo "coverage=$cov_line%" >> $GITHUB_OUTPUT
-          else
-            echo "coverage=0%" >> $GITHUB_OUTPUT
-            echo "No coverage data found or no testable code." >> $GITHUB_STEP_SUMMARY
-          fi
-
-          if grep -q "no tests ran" test_output.txt; then
-            echo "status=Success (no tests)" >> $GITHUB_OUTPUT
-            echo "No tests found to execute." >> $GITHUB_STEP_SUMMARY
-          elif grep -q "failed" test_output.txt; then
-            echo "status=Failure" >> $GITHUB_OUTPUT
-            echo "Test failures detected." >> $GITHUB_STEP_SUMMARY
-          elif grep -q "INTERNALERROR" test_output.txt; then
-            echo "status=Failure" >> $GITHUB_OUTPUT
-            echo "Internal error in test execution." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "status=Success" >> $GITHUB_OUTPUT
-            echo "All tests passed or skipped." >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # Perform mutation testing on PR-changed files
-      - name: Mutation testing
-        id: mutation
-        continue-on-error: true
-        timeout-minutes: 15
-        run: |
-          echo "### Mutation Testing" >> $GITHUB_STEP_SUMMARY
-
-          git fetch origin main:main || git fetch origin master:master
-          changed_files=$(git diff --name-only main...HEAD 2>/dev/null || git diff --name-only master...HEAD)
-          changed_py=$(echo "$changed_files" | grep -E '\.py$' | grep -v '^tests/' | grep -v '^venv/' | grep -v '^.venv/' || true)
-
-          if [ -n "$changed_py" ]; then
-            echo "Changed Python files:" >> $GITHUB_STEP_SUMMARY
-            echo "$changed_py" >> $GITHUB_STEP_SUMMARY
-
-            mutmut_version=$(mutmut --version | cut -d' ' -f2)
-            for file in $changed_py; do
-              echo "Mutating file: $file" >> $GITHUB_STEP_SUMMARY
-              if [[ "$mutmut_version" > "2.4.0" ]]; then
-                mutmut run --paths-to-mutate "$file" --tests-dir tests/ --test-time-multiplier 2.0 --max-mutants 25 > mut_output.txt 2>&1 || true
-              else
-                echo "Mutmut 2.4.0 detected (no --max-mutants support)" >> $GITHUB_STEP_SUMMARY
-                mutmut run --paths-to-mutate "$file" --tests-dir tests/ --test-time-multiplier 2.0 > mut_output.txt 2>&1 || true
-              fi
-              cat mut_output.txt >> $GITHUB_STEP_SUMMARY
-            done
-
-            summary_line=$(grep -E "Survived|Killed" mut_output.txt | tail -1 || true)
-            if [ -n "$summary_line" ]; then
-              killed=$(echo "$summary_line" | grep -oE 'Killed [0-9]+' | awk '{print $2}')
-              survived=$(echo "$summary_line" | grep -oE 'Survived [0-9]+' | awk '{print $2}')
-              total=$((killed + survived))
-              if [ "$total" -gt 0 ]; then
-                score=$(( killed * 100 / total ))
-                echo "score=$score%" >> $GITHUB_OUTPUT
-              else
-                echo "score=0%" >> $GITHUB_OUTPUT
-                echo "No mutants generated." >> $GITHUB_STEP_SUMMARY
-              fi
-            else
-              echo "score=0%" >> $GITHUB_OUTPUT
-              echo "Mutation testing failed or produced no results." >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "score=0%" >> $GITHUB_OUTPUT
-            echo "No Python files changed in the PR (excluding tests)." >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # Detect test smells using flake8 on test files
-      - name: Detect test smells
-        id: smells
-        continue-on-error: true
-        run: |
-          echo "### Test Smells Detection" >> $GITHUB_STEP_SUMMARY
-          if find . -type f -name "test_*.py" | grep -q .; then
-            find . -type f -name "test_*.py" -exec flake8 {} + > smells_output.txt 2>&1 || true
-            cat smells_output.txt >> $GITHUB_STEP_SUMMARY
-            smells_count=$(grep -c ":[0-9]*:[0-9]*:" smells_output.txt || echo 0)
-            echo "smells=$smells_count" >> $GITHUB_OUTPUT
-            if [ "$smells_count" -eq 0 ]; then
-              echo "No test smells detected." >> $GITHUB_STEP_SUMMARY
-            else
-              echo "$smells_count test smells detected. See details above." >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "smells=0" >> $GITHUB_OUTPUT
-            echo "No test files found." >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # Summarize all results
-      - name: Overall Summary
-        run: |
-          echo "## Results Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Compilation**: ${{ steps.compilation.outputs.status }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Test Execution**: ${{ steps.tests.outputs.status }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Coverage**: ${{ steps.tests.outputs.coverage }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Mutation Score**: ${{ steps.mutation.outputs.score }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Test Smells**: ${{ steps.smells.outputs.smells }}" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ $SMELL_COUNT -eq 0 ]; then
+          TEST_SMELLS="✅ No major test smells detected"
+        fi
+        
+        echo "smell_count=$SMELL_COUNT" >> $GITHUB_OUTPUT
+        echo "test_smells<<EOF" >> $GITHUB_OUTPUT
+        echo -e "$TEST_SMELLS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "Test smell analysis completed: $SMELL_COUNT issues found"
+    
+    - name: Run additional code quality checks
+      id: quality
+      continue-on-error: true
+      run: |
+        cd repo
+        echo "🔍 Running code quality checks..."
+        
+        # Pylint check
+        PYLINT_SCORE=0
+        if command -v pylint >/dev/null; then
+          PYLINT_OUTPUT=$(pylint --output-format=text $(find . -name "*.py" | head -10) 2>&1 || true)
+          PYLINT_SCORE=$(echo "$PYLINT_OUTPUT" | grep "Your code has been rated" | grep -o "[0-9.]*" | head -1 || echo "0")
+        fi
+        
+        # Flake8 check
+        FLAKE8_ISSUES=0
+        if command -v flake8 >/dev/null; then
+          FLAKE8_ISSUES=$(flake8 --count --select=E9,F63,F7,F82 --show-source --statistics . 2>/dev/null || echo "0")
+        fi
+        
+        # Cyclomatic complexity
+        COMPLEXITY_SCORE=0
+        if command -v radon >/dev/null; then
+          COMPLEXITY_SCORE=$(radon cc -s . | grep "Average complexity:" | grep -o "[0-9.]*" || echo "0")
+        fi
+        
+        echo "pylint_score=$PYLINT_SCORE" >> $GITHUB_OUTPUT
+        echo "flake8_issues=$FLAKE8_ISSUES" >> $GITHUB_OUTPUT
+        echo "complexity_score=$COMPLEXITY_SCORE" >> $GITHUB_OUTPUT
+        
+        echo "Code quality analysis completed"
+    
+    - name: Generate comprehensive report
+      id: report
+      run: |
+        cd repo
+        echo "📊 Generating comprehensive analysis report..."
+        
+        # Create detailed report
+        cat > analysis_report.md << 'EOL'
+# 🔍 Python PR Analysis Report
+        
+## 📋 PR Information
+- **Repository:** ${{ env.REPO_NAME }}
+- **PR Number:** #${{ env.PR_NUMBER }}
+- **Commit SHA:** ${{ steps.pr_info.outputs.head_sha }}
+- **Python Version:** ${{ env.PYTHON_VERSION }}
+- **Analysis Date:** $(date)
+        
+## ⚡ Quick Summary
+| Metric | Result | Status |
+|--------|---------|--------|
+| Compilation | ${{ steps.compilation.outputs.compilation_success == 'true' && '✅ Success' || '❌ Failed' }} | ${{ steps.compilation.outputs.compilation_success == 'true' && 'PASS' || 'FAIL' }} |
+| Tests | ${{ steps.tests.outputs.test_success == 'true' && '✅ Success' || '❌ Failed' }} | ${{ steps.tests.outputs.test_success == 'true' && 'PASS' || 'FAIL' }} |
+| Coverage | ${{ steps.tests.outputs.coverage_percentage }}% | ${{ steps.tests.outputs.coverage_percentage >= 80 && 'GOOD' || steps.tests.outputs.coverage_percentage >= 60 && 'FAIR' || 'POOR' }} |
+| Mutation Score | ${{ steps.mutation.outputs.mutation_score }}% | ${{ steps.mutation.outputs.mutation_score >= 75 && 'EXCELLENT' || steps.mutation.outputs.mutation_score >= 50 && 'GOOD' || 'NEEDS_WORK' }} |
+| Test Smells | ${{ steps.test_smells.outputs.smell_count }} issues | ${{ steps.test_smells.outputs.smell_count == 0 && 'CLEAN' || steps.test_smells.outputs.smell_count <= 5 && 'ACCEPTABLE' || 'NEEDS_ATTENTION' }} |
+        
+## 🔧 Project Structure
+- **Test Framework:** ${{ steps.project_info.outputs.test_framework }}
+- **Dependencies:** ${{ steps.project_info.outputs.has_requirements == 'true' && 'requirements.txt ' || '' }}${{ steps.project_info.outputs.has_setup_py == 'true' && 'setup.py ' || '' }}${{ steps.project_info.outputs.has_pyproject == 'true' && 'pyproject.toml ' || '' }}
+        
+## 🧪 Test Results
+        
+### Execution Status
+${{ steps.tests.outputs.test_success == 'true' && '✅ All tests passed successfully' || '❌ Some tests failed' }}
+        
+### Coverage Analysis
+- **Line Coverage:** ${{ steps.tests.outputs.coverage_percentage }}%
+- **Coverage Goal:** 80%+ (Recommended)
+        
+${{ steps.tests.outputs.coverage_percentage >= 80 && '🎯 Excellent coverage! Your tests cover most of the codebase.' || steps.tests.outputs.coverage_percentage >= 60 && '🔶 Fair coverage. Consider adding more tests for better protection.' || '🔻 Low coverage. Significant portions of code are untested.' }}
+        
+## 🧬 Mutation Testing
+        
+- **Mutation Score:** ${{ steps.mutation.outputs.mutation_score }}%
+- **Quality Assessment:** ${{ steps.mutation.outputs.mutation_score >= 75 && '🏆 Excellent - Your tests catch most bugs!' || steps.mutation.outputs.mutation_score >= 50 && '👍 Good - Tests are reasonably effective' || '⚠️ Poor - Tests may miss many bugs' }}
+        
+## 👃 Test Smell Analysis
+        
+${{ steps.test_smells.outputs.test_smells }}
+        
+**Total Issues Found:** ${{ steps.test_smells.outputs.smell_count }}
+        
+## 📏 Code Quality Metrics
+        
+- **Pylint Score:** ${{ steps.quality.outputs.pylint_score }}/10
+- **Flake8 Issues:** ${{ steps.quality.outputs.flake8_issues }}
+- **Complexity:** ${{ steps.quality.outputs.complexity_score }}
+        
+## 🚨 Compilation Issues
+        
+${{ steps.compilation.outputs.compilation_success == 'true' && '✅ No compilation errors found' || steps.compilation.outputs.syntax_errors }}
+        
+## 📝 Recommendations
+        
+${{ steps.tests.outputs.coverage_percentage < 80 && '- 📈 **Increase test coverage**: Aim for 80%+ coverage by adding tests for uncovered code paths' || '' }}
+${{ steps.mutation.outputs.mutation_score < 60 && '- 🧬 **Improve test quality**: Current mutation score suggests tests might not catch all bugs' || '' }}
+${{ steps.test_smells.outputs.smell_count > 5 && '- 👃 **Address test smells**: Refactor tests to improve maintainability and readability' || '' }}
+${{ steps.quality.outputs.flake8_issues > 0 && '- 🔧 **Fix code style issues**: Address flake8 violations for better code consistency' || '' }}
+${{ steps.compilation.outputs.compilation_success == 'false' && '- 🚨 **Fix compilation errors**: Resolve syntax errors before proceeding' || '' }}
+        
+## 🎯 Overall Assessment
+        
+EOL
+        
+        # Calculate overall score
+        TOTAL_SCORE=0
+        MAX_SCORE=500
+        
+        # Compilation (100 points)
+        if [ "${{ steps.compilation.outputs.compilation_success }}" = "true" ]; then
+          TOTAL_SCORE=$((TOTAL_SCORE + 100))
+        fi
+        
+        # Test execution (100 points)
+        if [ "${{ steps.tests.outputs.test_success }}" = "true" ]; then
+          TOTAL_SCORE=$((TOTAL_SCORE + 100))
+        fi
+        
+        # Coverage (100 points max)
+        COVERAGE_POINTS=$(echo "${{ steps.tests.outputs.coverage_percentage }}" | awk '{print int($1)}')
+        TOTAL_SCORE=$((TOTAL_SCORE + COVERAGE_POINTS))
+        
+        # Mutation score (100 points max)
+        MUTATION_POINTS=$(echo "${{ steps.mutation.outputs.mutation_score }}" | awk '{print int($1)}')
+        TOTAL_SCORE=$((TOTAL_SCORE + MUTATION_POINTS))
+        
+        # Test smells (100 points - smell penalty)
+        SMELL_PENALTY=$((steps.test_smells.outputs.smell_count * 10))
+        SMELL_POINTS=$((100 - SMELL_PENALTY))
+        if [ $SMELL_POINTS -lt 0 ]; then SMELL_POINTS=0; fi
+        TOTAL_SCORE=$((TOTAL_SCORE + SMELL_POINTS))
+        
+        PERCENTAGE_SCORE=$((TOTAL_SCORE * 100 / MAX_SCORE))
+        
+        # Add overall assessment to report
+        if [ $PERCENTAGE_SCORE -ge 90 ]; then
+          echo "🏆 **EXCELLENT** ($PERCENTAGE_SCORE/100) - This PR demonstrates outstanding code quality and testing practices!" >> analysis_report.md
+        elif [ $PERCENTAGE_SCORE -ge 75 ]; then
+          echo "✅ **GOOD** ($PERCENTAGE_SCORE/100) - This PR shows solid development practices with room for minor improvements." >> analysis_report.md
+        elif [ $PERCENTAGE_SCORE -ge 60 ]; then
+          echo "🔶 **ACCEPTABLE** ($PERCENTAGE_SCORE/100) - This PR meets basic standards but has several areas for improvement." >> analysis_report.md
+        else
+          echo "⚠️ **NEEDS WORK** ($PERCENTAGE_SCORE/100) - This PR requires significant improvements before it can be considered ready." >> analysis_report.md
+        fi
+        
+        echo "" >> analysis_report.md
+        echo "---" >> analysis_report.md
+        echo "*Analysis completed on $(date) using GitHub Actions*" >> analysis_report.md
+        
+        # Output the report
+        cat analysis_report.md
+        
+        echo "report_score=$PERCENTAGE_SCORE" >> $GITHUB_OUTPUT
+        echo "Analysis completed with overall score: $PERCENTAGE_SCORE/100"
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: pr-analysis-results
+        path: |
+          repo/analysis_report.md
+          repo/coverage.xml
+          repo/test-results.xml
+          repo/test_output.txt
+          repo/mutation_output.txt
+        retention-days: 30
+    
+    - name: Comment results summary
+      run: |
+        echo "## 🎯 PR Analysis Complete!"
+        echo ""
+        echo "**Overall Score:** ${{ steps.report.outputs.report_score }}/100"
+        echo ""
+        echo "### Key Metrics:"
+        echo "- ⚡ Compilation: ${{ steps.compilation.outputs.compilation_success == 'true' && '✅ Success' || '❌ Failed' }}"
+        echo "- 🧪 Tests: ${{ steps.tests.outputs.test_success == 'true' && '✅ Passed' || '❌ Failed' }}"
+        echo "- 📊 Coverage: ${{ steps.tests.outputs.coverage_percentage }}%"
+        echo "- 🧬 Mutation Score: ${{ steps.mutation.outputs.mutation_score }}%"
+        echo "- 👃 Test Smells: ${{ steps.test_smells.outputs.smell_count }} issues"
+        echo ""
+        echo "📄 **Full analysis report available in the artifacts section**"
