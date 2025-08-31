@@ -265,7 +265,7 @@ jobs:
     # Step 13: Upload artifacts (report, test results, coverage, mutation logs)
     # -------------------------------------------------------------
     - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: pr-analysis-results
