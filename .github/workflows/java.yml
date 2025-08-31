@@ -23,7 +23,7 @@ jobs:
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
-          java-version: '21'  # Updated to Java 21
+          java-version: '21'
           distribution: 'temurin'
 
       - name: Download JaCoCo
@@ -32,6 +32,52 @@ jobs:
           unzip jacoco.zip
           mv lib/jacocoagent.jar .
           mv lib/jacococli.jar .
+
+      - name: Ensure Maven POM exists
+        run: |
+          if [ ! -f pom.xml ]; then
+            echo '<?xml version="1.0" encoding="UTF-8"?>
+            <project xmlns="http://maven.apache.org/POM/4.0.0"
+                     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+                <modelVersion>4.0.0</modelVersion>
+                <groupId>com.example</groupId>
+                <artifactId>temp-project</artifactId>
+                <version>1.0-SNAPSHOT</version>
+                <build>
+                    <plugins>
+                        <plugin>
+                            <groupId>org.apache.maven.plugins</groupId>
+                            <artifactId>maven-compiler-plugin</artifactId>
+                            <version>3.14.0</version>
+                            <configuration>
+                                <source>21</source>
+                                <target>21</target>
+                            </configuration>
+                        </plugin>
+                        <plugin>
+                            <groupId>org.pitest</groupId>
+                            <artifactId>pitest-maven</artifactId>
+                            <version>1.20.2</version>
+                            <configuration>
+                                <targetClasses>
+                                    <param>com.example.*</param> <!-- Replace with project package -->
+                                </targetClasses>
+                                <targetTests>
+                                    <param>com.example.*</param>
+                                </targetTests>
+                                <excludedClasses>
+                                    <param>org.pitest.*</param>
+                                </excludedClasses>
+                                <outputFormats>
+                                    <param>HTML</param>
+                                </outputFormats>
+                            </configuration>
+                        </plugin>
+                    </plugins>
+                </build>
+            </project>' > pom.xml
+          fi
 
       - name: Compilation check
         id: compile
@@ -48,6 +94,7 @@ jobs:
 
       - name: Run tests with coverage
         id: test
+        if: steps.compile.outcome == 'success'
         continue-on-error: true
         run: |
           echo "::group::Test Output"
@@ -70,6 +117,7 @@ jobs:
             java -jar jacococli.jar report jacoco.exec --classfiles target/classes --sourcefiles src/main/java --html coverage-report
             coverage=$(grep -oP '(?<=Total</td><td class="ctr2">)\d+%' coverage-report/index.html || echo "N/A")
             echo "Code Coverage: $coverage"
+            echo "COVERAGE=$coverage" >> $GITHUB_ENV
           else
             echo "Code Coverage: N/A (jacoco.exec not found)"
             mkdir -p coverage-report
@@ -77,20 +125,17 @@ jobs:
           fi
 
       - name: Run mutation testing with Maven PITest
-        if: always()
+        if: steps.compile.outcome == 'success'
         continue-on-error: true
         run: |
           echo "::group::Mutation Testing Output"
-          mvn org.pitest:pitest-maven:mutationCoverage \
-            -DoutputFormats=HTML \
-            -DreportsDirectory=mutation-report \
-            -DtargetClasses='com.example.*' \  # Replace with project-specific package
-            -DtargetTests='com.example.*' \
-            -DexcludedClasses='org.pitest.*' || echo "Mutation testing failed"
+          mvn org.pitest:pitest-maven:1.20.2:mutationCoverage -e -X || echo "Mutation testing failed"
           echo "::endgroup::"
-          if [ -f mutation-report/index.html ]; then
-            mutation_score=$(grep -oP '(?<=Mutation score</td><td>)\d+%' mutation-report/index.html || echo "N/A")
+          if [ -f target/pit-reports/index.html ]; then
+            mutation_score=$(grep -oP '(?<=Mutation score</td><td>)\d+%' target/pit-reports/index.html || echo "N/A")
             echo "Mutation Score: $mutation_score"
+            echo "MUTATION_SCORE=$mutation_score" >> $GITHUB_ENV
+            mv target/pit-reports mutation-report
           else
             echo "Mutation Score: N/A"
             mkdir -p mutation-report
@@ -102,13 +147,12 @@ jobs:
         continue-on-error: true
         run: |
           echo "::group::Test Smells Detection"
-          # Placeholder: TSDetect requires specific execution (not a standalone JAR)
-          echo "Test Smells: N/A (TSDetect execution method TBD)"
-          # Example: Replace with actual command once clarified, e.g.:
-          # git clone https://github.com/TestSmells/TSDetect.git tsdetect
-          # cd tsdetect
-          # ./gradlew run --args="path/to/src/test/java" || echo "Test smells detection failed"
-          echo "Test Smells: N/A (detector not executable)"
+          # Placeholder: Use a hypothetical CLI tool or custom script
+          echo "Test Smells: N/A (Using placeholder; replace with actual tool)"
+          # Example: If using a tool like tsDetect CLI (hypothetical)
+          # curl -L https://example.com/tsdetect-cli.jar -o tsdetect.jar
+          # java -jar tsdetect.jar src/test/java --output output.csv || echo "Test smells detection failed"
+          echo "No test smells data" > test-smells-report.txt
           echo "::endgroup::"
 
       - name: Get test smells summary
@@ -117,6 +161,7 @@ jobs:
           if [ -f output.csv ]; then
             smells_count=$(tail -n +2 output.csv | grep -o 'true' | wc -l || echo 0)
             echo "Detected Test Smells: $smells_count"
+            echo "SMELLS_COUNT=$smells_count" >> $GITHUB_ENV
             cat output.csv
           else
             echo "Test Smells: N/A (output.csv not found)"
@@ -134,3 +179,22 @@ jobs:
             *.csv
             jacoco.exec
             test-smells-report.txt
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const summary = `**PR Analysis Summary**\n` +
+                            `- Compilation: ${{ steps.compile.outcome == 'success' ? 'Success' : 'Failed' }}\n` +
+                            `- Test Execution: ${{ steps.test.outcome == 'success' ? 'Success' : 'Failed' }}\n` +
+                            `- Code Coverage: ${{ env.COVERAGE || 'N/A' }}\n` +
+                            `- Mutation Score: ${{ env.MUTATION_SCORE || 'N/A' }}\n` +
+                            `- Test Smells: ${{ env.SMELLS_COUNT || 'N/A' }}`;
+            github.rest.issues.createComment({
+              owner: '${{ inputs.repo.split('/')[0] }}',
+              repo: '${{ inputs.repo.split('/')[1] }}',
+              issue_number: ${{ inputs.pr }},
+              body: summary
+            });
