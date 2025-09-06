@@ -40,6 +40,45 @@ jobs:
           fi
           echo "✅ Inputs validated successfully"
 
+      - name: Get PR information
+        id: pr_info
+        run: |
+          PR_DATA=$(gh api repos/${{ github.event.inputs.repo_name }}/pulls/${{ github.event.inputs.pr_number }})
+          BASE_SHA=$(echo "$PR_DATA" | jq -r '.base.sha')
+          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.base.ref')
+          STATE=$(echo "$PR_DATA" | jq -r '.state')
+          DRAFT=$(echo "$PR_DATA" | jq -r '.draft')
+          MERGEABLE=$(echo "$PR_DATA" | jq -r '.mergeable')
+          echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+          echo "state=$STATE" >> $GITHUB_OUTPUT
+          echo "draft=$DRAFT" >> $GITHUB_OUTPUT
+          echo "mergeable=$MERGEABLE" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check PR status
+        run: |
+          if [ "${{ steps.pr_info.outputs.state }}" != "open" ]; then
+            echo "❌ PR is ${{ steps.pr_info.outputs.state }}, cannot analyze. Merge ref may not exist."
+            exit 1
+          fi
+          if [ "${{ steps.pr_info.outputs.draft }}" == "true" ]; then
+            echo "❌ PR is a draft, merge ref may not be available."
+            exit 1
+          fi
+          if [ "${{ steps.pr_info.outputs.mergeable }}" != "true" ]; then
+            if [ "${{ steps.pr_info.outputs.mergeable }}" == "null" ]; then
+              echo "⚠️ Mergeable status not computed yet. Please try again later."
+            else
+              echo "❌ PR is not mergeable (e.g., conflicts), merge ref not available."
+            fi
+            exit 1
+          fi
+          echo "✅ PR is open, not draft, and mergeable."
+
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
@@ -54,19 +93,6 @@ jobs:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
           cache: 'maven'  # Cache Maven repository for both build systems
-
-      - name: Get PR information
-        id: pr_info
-        run: |
-          PR_DATA=$(gh api repos/${{ github.event.inputs.repo_name }}/pulls/${{ github.event.inputs.pr_number }})
-          BASE_SHA=$(echo "$PR_DATA" | jq -r '.base.sha')
-          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
-          BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.base.ref')
-          echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
-          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
-          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Detect build system
         id: detect_build
@@ -1015,6 +1041,7 @@ jobs:
           import json
           import sys
           import re
+          import os
           
           def get_status(percentage):
               perc = float(percentage)
@@ -1025,12 +1052,27 @@ jobs:
               else:
                   return 'failure', '❌ Low'
           
-          # Load data
-          with open('artifacts/test-analysis-reports/metrics.json', 'r') as f:
-              metrics = json.load(f)
+          metrics_file = 'artifacts/test-analysis-reports/metrics.json'
+          smells_file = 'artifacts/test-analysis-reports/test_smells.json'
           
-          with open('artifacts/test-analysis-reports/test_smells.json', 'r') as f:
-              smells_data = json.load(f)
+          if not os.path.exists(metrics_file) or not os.path.exists(smells_file):
+              print("Missing data files, using defaults.")
+              metrics = {
+                  'tests_passed': '0',
+                  'tests_run': '0',
+                  'line_coverage': '0.00',
+                  'branch_coverage': '0.00',
+                  'mutation_score': '0',
+                  'total_smells': '0',
+                  'success_rate': '0'
+              }
+              smells_data = {'smells': {}}
+          else:
+              with open(metrics_file, 'r') as f:
+                  metrics = json.load(f)
+              
+              with open(smells_file, 'r') as f:
+                  smells_data = json.load(f)
           
           # Load HTML
           with open('index.html', 'r') as f:
@@ -1062,6 +1104,8 @@ jobs:
           for smell, count in smells_data['smells'].items():
               severity_class, severity_text = get_status(100 - (count * 10)) if count > 0 else ('success', '✅ None')
               smells_rows += f'<tr><td>{smell.replace("_", " ").title()}</td><td>{count}</td><td><span class="status-badge status-{severity_class}">{severity_text}</span></td></tr>'
+          if not smells_rows:
+              smells_rows = '<tr><td colspan="3" style="text-align: center;">No smells detected</td></tr>'
           
           html = re.sub(r'<tbody id="smells-table">.*?</tbody>', f'<tbody id="smells-table">{smells_rows}</tbody>', html, flags=re.DOTALL)
           
