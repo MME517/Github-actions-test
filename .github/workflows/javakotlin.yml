@@ -1,4 +1,4 @@
-# .github/workflows/pr-test-analysis.yml
+# .github/workflows/javakotlin.yml
 name: PR Test Analysis Workflow
 
 on:
@@ -32,6 +32,9 @@ jobs:
     name: Analyze PR (tests, coverage, mutation, smells)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    env:
+      REPO: ${{ inputs.repo_name }}
+      PR: ${{ inputs.pr_number }}
 
     steps:
       - name: Install small helpers
@@ -121,17 +124,18 @@ jobs:
           BUILD_TOOL=$(detect_tool)
           echo "Detected build tool: $BUILD_TOOL"
 
-          # write a small JSON state file (valid JSON)
-          cat > analysis_state.json <<EOF
-{
-  "build_tool": "${BUILD_TOOL}",
-  "compilation_success": null,
-  "merged": "${{ steps.merge_pr.outputs.merged || 'false' }}",
-  "merge_conflict": "${{ steps.merge_pr.outputs.merge_conflict || 'false' }}"
-}
-EOF
-
+          # Ensure analysis directory exists
           mkdir -p analysis-reports
+
+          # Write a small JSON state file safely (avoid YAML/heredoc pitfalls)
+          MERGED="${{ steps.merge_pr.outputs.merged }}"
+          MERGED=${MERGED:-false}
+          MERGE_CONFLICT="${{ steps.merge_pr.outputs.merge_conflict }}"
+          MERGE_CONFLICT=${MERGE_CONFLICT:-false}
+
+          printf '{"build_tool":"%s","compilation_success":null,"merged":"%s","merge_conflict":"%s"}\n' \
+            "$BUILD_TOOL" "$MERGED" "$MERGE_CONFLICT" \
+            > analysis-reports/analysis_state.json
 
           COMPILATION_SUCCESS=true
 
@@ -195,13 +199,13 @@ EOF
             COMPILATION_SUCCESS=false
           fi
 
-          # update analysis_state.json with compilation result
+          # update analysis_state.json with compilation result (use Python to avoid JSON errors)
           python3 - <<PY
-import json, sys
-p='analysis_state.json'
+import json
+p='analysis-reports/analysis_state.json'
 with open(p,'r') as f:
     s=json.load(f)
-s['compilation_success']=${COMPILATION_SUCCESS}
+s['compilation_success'] = ${COMPILATION_SUCCESS}
 with open('analysis-reports/analysis_state.json','w') as f:
     json.dump(s,f,indent=2)
 print('WROTE analysis-reports/analysis_state.json')
