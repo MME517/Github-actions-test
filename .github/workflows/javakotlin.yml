@@ -1,4 +1,4 @@
-name: Analyze PR
+name: Analyze PR Quality
 
 on:
   workflow_dispatch:
@@ -15,102 +15,130 @@ on:
 jobs:
   analyze-pr:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout base branch
+      # Checkout base repo
+      - name: Checkout base repository
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.repo }}
-          ref: ${{ github.event.pull_request.base.ref }}
           path: base
+          fetch-depth: 0
 
-      - name: Checkout PR branch
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.inputs.repo }}
-          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
-          path: pr
+      # Fetch the PR branch
+      - name: Fetch PR code
+        run: |
+          git clone https://github.com/${{ github.event.inputs.repo }} pr
+          cd pr
+          git fetch origin pull/${{ github.event.inputs.pr_number }}/head:pr-branch
+          git checkout pr-branch
 
-      - name: Set up JDK
+      # Setup Java & Kotlin
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-home-v1-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: gradle-home-v1-${{ runner.os }}-
+      # Detect build system
+      - name: Detect build tool
+        id: detect
+        run: |
+          if [ -f "pr/build.gradle" ] || [ -f "pr/build.gradle.kts" ]; then
+            echo "tool=gradle" >> $GITHUB_OUTPUT
+          elif [ -f "pr/pom.xml" ]; then
+            echo "tool=maven" >> $GITHUB_OUTPUT
+          else
+            echo "No supported build tool detected (Gradle/Maven)."
+            exit 1
+          fi
 
-      - name: Build & compile (allow style failures)
-        working-directory: pr
+      # Compile project
+      - name: Compile Project
+        id: compile
         run: |
           set +e
-          ./gradlew clean build --no-daemon
-          status=$?
-          set -e
-          if [ $status -ne 0 ]; then
-            echo "⚠️ Build completed with style or lint errors, continuing..."
+          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
+            cd pr
+            ./gradlew clean compileJava compileTestJava
+          else
+            cd pr
+            mvn -B clean compile test-compile
           fi
-          echo "compilation_success=true" >> $GITHUB_OUTPUT
+          echo "compilation_success=$?" >> $GITHUB_OUTPUT
+          set -e
 
-      - name: Run tests with coverage
-        working-directory: pr
+      # Run tests
+      - name: Run Tests
+        id: tests
         run: |
-          ./gradlew test jacocoTestReport --no-daemon
-          echo "execution_success=true" >> $GITHUB_OUTPUT
+          set +e
+          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
+            cd pr
+            ./gradlew test
+          else
+            cd pr
+            mvn -B test
+          fi
+          echo "execution_success=$?" >> $GITHUB_OUTPUT
+          set -e
 
-      - name: Run mutation testing
-        working-directory: pr
+      # Run Coverage
+      - name: Run Coverage
         run: |
-          ./gradlew pitest --no-daemon || true
+          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
+            cd pr
+            ./gradlew jacocoTestReport
+          else
+            cd pr
+            mvn -B jacoco:report
+          fi
 
-      - name: Run test smell analysis
-        working-directory: pr
+      # Run Mutation Testing
+      - name: Run Mutation Testing
         run: |
-          ./gradlew testSmellsReport || echo "test_smells_failed=true"
+          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
+            cd pr
+            ./gradlew pitest
+          else
+            cd pr
+            mvn -B org.pitest:pitest-maven:mutationCoverage
+          fi
 
-      - name: Upload reports
+      # Run Test Smells
+      - name: Run Test Smells
+        run: |
+          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
+            cd pr
+            ./gradlew testSmells || true
+          else
+            cd pr
+            mvn -B test-compile || true
+          fi
+
+      # Upload reports
+      - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports
+          name: pr-analysis-reports
           path: |
             pr/**/build/reports/tests/**
             pr/**/build/reports/jacoco/**
             pr/**/build/reports/pitest/**
-            pr/**/build/reports/test-smells/**
+            pr/**/build/reports/testSmells/**
+            pr/**/target/surefire-reports/**
+            pr/**/target/site/jacoco/**
+            pr/**/target/pit-reports/**
 
-      - name: Generate summary
-        id: summary
+      # Final summary
+      - name: Generate Summary
         run: |
-          echo "📊 Test Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Compilation: ✅ (style checks may have warnings)" >> $GITHUB_STEP_SUMMARY
-          echo "- Execution: ✅" >> $GITHUB_STEP_SUMMARY
-
-          # Coverage
-          COV_FILE=$(find pr -name 'jacocoTestReport.xml' | head -n 1)
-          if [ -f "$COV_FILE" ]; then
-            COV=$(grep -o 'line-rate="[0-9.]*"' "$COV_FILE" | head -n 1 | cut -d'"' -f2)
-            echo "- Coverage: ${COV}" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Coverage: ❌ Not found" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Mutation
-          if [ -f pr/build/reports/pitest/index.html ]; then
-            echo "- Mutation: ✅ Report generated" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Mutation: ❌ No report" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Test Smells
-          if [ -f pr/build/reports/test-smells/test-smells-report.json ]; then
-            echo "- Test Smells: ✅ Report generated" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Test Smells: ❌ No report" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "📊 PR Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Compilation: ${{ steps.compile.outputs.compilation_success == 0 && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Execution: ${{ steps.tests.outputs.execution_success == 0 && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Coverage: see JaCoCo report" >> $GITHUB_STEP_SUMMARY
+          echo "- Mutation: see PIT report" >> $GITHUB_STEP_SUMMARY
+          echo "- Test Smells: see testSmells report" >> $GITHUB_STEP_SUMMARY
 
 
