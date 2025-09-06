@@ -11,9 +11,13 @@ on:
         description: 'Pull Request number'
         required: true
         type: string
+      java_version:
+        description: 'Java version to use (default: 21)'
+        required: false
+        type: string
+        default: '21'
 
 env:
-  JAVA_VERSION: '17'
   GRADLE_VERSION: '8.5'
   MAVEN_VERSION: '3.9.6'
   KOTLIN_VERSION: '1.9.0'
@@ -53,17 +57,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: ${{ env.JAVA_VERSION }}
-
-      - name: Setup Kotlin
-        uses: fwilhe2/setup-kotlin@v1
-        with:
-          version: ${{ env.KOTLIN_VERSION }}
 
       - name: Get PR information
         id: pr_info
@@ -119,19 +112,50 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Detect build system
+      - name: Detect build system and Java version
         id: detect_build
         run: |
           if [ -f "pr-repo/pom.xml" ]; then
             echo "build_system=maven" >> $GITHUB_OUTPUT
             echo "📦 Detected Maven project"
+            
+            # Try to detect Java version from pom.xml
+            JAVA_VERSION_POM=$(grep -oP '<maven.compiler.(target|release)>(\K\d+)' pr-repo/pom.xml | head -1 || echo "")
+            if [ -n "$JAVA_VERSION_POM" ]; then
+              echo "📋 Detected Java version in pom.xml: $JAVA_VERSION_POM"
+              echo "java_version=$JAVA_VERSION_POM" >> $GITHUB_OUTPUT
+            else
+              echo "java_version=${{ github.event.inputs.java_version }}" >> $GITHUB_OUTPUT
+            fi
+            
           elif [ -f "pr-repo/build.gradle" ] || [ -f "pr-repo/build.gradle.kts" ]; then
             echo "build_system=gradle" >> $GITHUB_OUTPUT
             echo "📦 Detected Gradle project"
+            
+            # Try to detect Java version from gradle properties
+            JAVA_VERSION_GRADLE=$(grep -oP 'targetCompatibility.*=.*["'']?(\K\d+)' pr-repo/build.gradle pr-repo/build.gradle.kts 2>/dev/null | head -1 || echo "")
+            if [ -n "$JAVA_VERSION_GRADLE" ]; then
+              echo "📋 Detected Java version in Gradle: $JAVA_VERSION_GRADLE"
+              echo "java_version=$JAVA_VERSION_GRADLE" >> $GITHUB_OUTPUT
+            else
+              echo "java_version=${{ github.event.inputs.java_version }}" >> $GITHUB_OUTPUT
+            fi
+            
           else
             echo "❌ No supported build system found"
             exit 1
           fi
+
+      - name: Setup Java with detected version
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ steps.detect_build.outputs.java_version }}
+
+      - name: Setup Kotlin
+        uses: fwilhe2/setup-kotlin@v1
+        with:
+          version: ${{ env.KOTLIN_VERSION }}
 
       - name: Setup Gradle
         if: steps.detect_build.outputs.build_system == 'gradle'
@@ -395,6 +419,7 @@ jobs:
           **Pull Request:** #${{ github.event.inputs.pr_number }}  
           **Analysis Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")  
           **Build System:** ${{ steps.detect_build.outputs.build_system }}
+          **Java Version:** ${{ steps.detect_build.outputs.java_version }}
           
           ---
           
