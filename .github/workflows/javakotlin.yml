@@ -40,6 +40,14 @@ jobs:
           fi
           echo "✅ Inputs validated successfully"
 
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo_name }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -52,14 +60,6 @@ jobs:
           curl -s https://get.sdkman.io | bash
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           sdk install kotlin
-
-      - name: Checkout target repository
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.inputs.repo_name }}
-          ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get PR information
         id: pr_info
@@ -572,7 +572,7 @@ jobs:
           |-------|----------|
           | Compilation | ${{ steps.compile_base.outputs.compilation_time }}s |
           | Test Execution | ${{ steps.run_tests.outputs.test_time }}s |
-          | Total Analysis | $(({{ steps.compile_base.outputs.compilation_time }} + {{ steps.run_tests.outputs.test_time }}))s |
+          | Total Analysis | $(( ${steps.compile_base.outputs.compilation_time} + ${steps.run_tests.outputs.test_time} ))s |
           
           ## 📝 Changed Test Files
           
