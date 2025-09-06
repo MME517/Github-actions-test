@@ -41,14 +41,14 @@ jobs:
           cd ..
           echo "Test files copied to ./tests"
 
-      # Install JDK
+      # Setup Java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ github.event.inputs.java_version }}
 
-      # Build base repo
+      # Build base project
       - name: Build base project
         working-directory: base
         run: |
@@ -74,13 +74,32 @@ jobs:
             ./gradlew test jacocoTestReport || gradle test jacocoTestReport
           fi
 
-      # Run mutation testing with PIT
-      - name: Run Mutation Tests
+      # Ensure PIT plugin for Maven projects
+      - name: Inject PIT plugin if missing (Maven)
+        if: hashFiles('base/pom.xml') != ''
+        run: |
+          if ! grep -q "pitest-maven" base/pom.xml; then
+            echo "Injecting PIT plugin into pom.xml..."
+            xmlstarlet ed -L \
+              -s "/project/build" -t elem -n "pluginsTMP" -v "" \
+              -s "/project/build/pluginsTMP" -t elem -n "plugin" -v "" \
+              -s "/project/build/pluginsTMP/plugin" -t elem -n "groupId" -v "org.pitest" \
+              -s "/project/build/pluginsTMP/plugin" -t elem -n "artifactId" -v "pitest-maven" \
+              -s "/project/build/pluginsTMP/plugin" -t elem -n "version" -v "1.20.2" \
+              -s "/project/build/pluginsTMP/plugin" -t elem -n "configuration" -v "" \
+              -s "/project/build/pluginsTMP/plugin/configuration" -t elem -n "targetClasses" -v "*" \
+              -s "/project/build/pluginsTMP/plugin/configuration" -t elem -n "targetTests" -v "*" \
+              base/pom.xml
+            xmlstarlet ed -L -r "/project/build/pluginsTMP" -v "plugins" base/pom.xml
+          fi
+
+      # Run mutation testing
+      - name: Run Mutation Tests (PIT)
         working-directory: base
         run: |
           if [ -f "mvnw" ] || [ -f "pom.xml" ]; then
             ./mvnw org.pitest:pitest-maven:mutationCoverage || mvn org.pitest:pitest-maven:mutationCoverage
-          else
+          elif [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
             ./gradlew pitest || gradle pitest
           fi
 
@@ -93,7 +112,7 @@ jobs:
         run: |
           java -jar tsdetect.jar -p ./base/src/test -o ./base/tsdetect-report.json || echo "TSDetect failed"
 
-      # Collect Results
+      # Collect reports
       - name: Collect Reports
         run: |
           mkdir -p reports
@@ -110,15 +129,28 @@ jobs:
           echo "- ✅ Build succeeded" >> summary.md
           echo "### Coverage" >> summary.md
           if [ -f reports/coverage.xml ]; then
-            COVERAGE=$(xmllint --xpath 'string(//report/counter[@type="INSTRUCTION"]/@covered)' reports/coverage.xml 2>/dev/null || echo "N/A")
-            echo "- Coverage: $COVERAGE instructions covered" >> summary.md
+            COVERED=$(xmllint --xpath 'string(//counter[@type="INSTRUCTION"]/@covered)' reports/coverage.xml 2>/dev/null || echo "N/A")
+            MISSED=$(xmllint --xpath 'string(//counter[@type="INSTRUCTION"]/@missed)' reports/coverage.xml 2>/dev/null || echo "N/A")
+            if [ "$COVERED" != "N/A" ] && [ "$MISSED" != "N/A" ]; then
+              TOTAL=$((COVERED+MISSED))
+              PERCENT=$((100*COVERED/TOTAL))
+              echo "- Coverage: $PERCENT% ($COVERED/$TOTAL instructions)" >> summary.md
+            else
+              echo "- Coverage: Not available" >> summary.md
+            fi
           else
             echo "- Coverage: Not available" >> summary.md
           fi
           echo "### Mutation Testing" >> summary.md
           if [ -f reports/mutation.xml ]; then
-            MUT_SCORE=$(xmllint --xpath 'string(//mutationMatrix/@score)' reports/mutation.xml 2>/dev/null || echo "N/A")
-            echo "- Mutation Score: $MUT_SCORE" >> summary.md
+            KILLED=$(xmllint --xpath 'count(//mutation[status="KILLED"])' reports/mutation.xml 2>/dev/null || echo "0")
+            TOTAL=$(xmllint --xpath 'count(//mutation)' reports/mutation.xml 2>/dev/null || echo "0")
+            if [ "$TOTAL" -gt 0 ]; then
+              SCORE=$((100*KILLED/TOTAL))
+              echo "- Mutation Score: $SCORE% ($KILLED/$TOTAL)" >> summary.md
+            else
+              echo "- Mutation Score: Not available" >> summary.md
+            fi
           else
             echo "- Mutation Score: Not available" >> summary.md
           fi
@@ -137,3 +169,4 @@ jobs:
           path: |
             reports/
             summary.md
+
