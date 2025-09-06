@@ -1,9 +1,9 @@
-name: Java/Kotlin PR Test Workflow
+name: Analyze PR
 
 on:
   workflow_dispatch:
     inputs:
-      repo_name:
+      repo:
         description: "Repository (e.g. owner/name)"
         required: true
         type: string
@@ -11,205 +11,99 @@ on:
         description: "Pull request number"
         required: true
         type: string
-      language:
-        description: "Project language"
-        required: true
-        type: choice
-        options:
-          - java
-          - kotlin
 
 jobs:
   analyze-pr:
     runs-on: ubuntu-latest
-    env:
-      JAVA_VERSION: '17'
-      GRADLE_VERSION: '8.5'
-      MAVEN_VERSION: '3.9.6'
-
     steps:
-      # ✅ Checkout PR HEAD and Base
-      - name: Checkout PR Head
+      - name: Checkout base branch
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.repo_name }}
-          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
-          fetch-depth: 0
-          path: pr
-
-      - name: Checkout Base Branch
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.inputs.repo_name }}
-          ref: main
-          fetch-depth: 0
+          repository: ${{ github.event.inputs.repo }}
+          ref: ${{ github.event.pull_request.base.ref }}
           path: base
 
-      - name: Setup Java
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
+          path: pr
+
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: ${{ env.JAVA_VERSION }}
-          cache: gradle
+          distribution: temurin
+          java-version: 17
 
-      - name: Cache Maven
-        uses: actions/cache@v3
+      - name: Cache Gradle
+        uses: actions/cache@v4
         with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-maven-
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-home-v1-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-home-v1-${{ runner.os }}-
 
-      - name: Install Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: ${{ env.GRADLE_VERSION }}
-
-      - name: Install Maven
-        uses: stCarolas/setup-maven@v4
-        with:
-          maven-version: ${{ env.MAVEN_VERSION }}
-
-      - name: Install Kotlin
+      - name: Build & compile
+        working-directory: pr
         run: |
-          curl -s https://get.sdkman.io | bash
-          source "$HOME/.sdkman/bin/sdkman-init.sh"
-          sdk install kotlin
+          ./gradlew clean build --no-daemon
+          echo "compilation_success=true" >> $GITHUB_OUTPUT
 
-      # ✅ Detect changed test files
-      - name: Get changed test files
-        id: changes
-        run: |
-          cd pr
-          git fetch origin main
-          CHANGED=$(git diff --name-only origin/main | grep -E "src/test/.*\.(java|kt)" || true)
-          echo "changed_tests=$CHANGED" >> $GITHUB_OUTPUT
-
-      # ✅ Copy PR test files into base repo
-      - name: Copy PR tests into base repo
-        if: steps.changes.outputs.changed_tests != ''
-        run: |
-          for file in ${{ steps.changes.outputs.changed_tests }}; do
-            mkdir -p $(dirname base/$file)
-            cp pr/$file base/$file
-          done
-
-      # ✅ Compile
-      - name: Compile project
-        id: compile
-        run: |
-          cd base
-          START=$(date +%s)
-          ./gradlew clean build -x test || mvn -B clean compile
-          END=$(date +%s)
-          echo "compilation_time=$((END - START))" >> $GITHUB_OUTPUT
-
-      # ✅ Run tests with coverage
       - name: Run tests with coverage
-        id: tests
+        working-directory: pr
         run: |
-          cd base
-          START=$(date +%s)
-          ./gradlew test jacocoTestReport || mvn -B test jacoco:report
-          END=$(date +%s)
-          echo "test_time=$((END - START))" >> $GITHUB_OUTPUT
+          ./gradlew test jacocoTestReport --no-daemon
+          echo "execution_success=true" >> $GITHUB_OUTPUT
 
-      # ✅ Extract coverage %
-      - name: Parse coverage report
-        id: coverage
+      - name: Run mutation testing
+        working-directory: pr
         run: |
-          cd base
-          REPORT=$(find . -name "jacocoTestReport.xml" | head -n 1)
-          if [ -f "$REPORT" ]; then
-            COVERED=$(xmllint --xpath "string(//counter[@type='LINE']/@covered)" $REPORT)
-            MISSED=$(xmllint --xpath "string(//counter[@type='LINE']/@missed)" $REPORT)
-            TOTAL=$((COVERED + MISSED))
-            if [ "$TOTAL" -gt 0 ]; then
-              PERCENT=$((COVERED * 100 / TOTAL))
-            else
-              PERCENT=0
-            fi
-            echo "coverage=$PERCENT" >> $GITHUB_OUTPUT
-          fi
+          ./gradlew pitest --no-daemon || true
 
-      # ✅ Mutation testing (PIT)
-      - name: Run mutation tests
-        id: mutation
-        continue-on-error: true
+      - name: Run test smell analysis
+        working-directory: pr
         run: |
-          cd base
-          ./gradlew pitest || mvn org.pitest:pitest-maven:mutationCoverage
+          ./gradlew testSmellsReport || echo "test_smells_failed=true"
 
-      - name: Parse mutation score
-        id: mutation_score
-        run: |
-          cd base
-          REPORT=$(find . -name "mutations.xml" | head -n 1)
-          if [ -f "$REPORT" ]; then
-            DETECTED=$(xmllint --xpath "count(//mutation[@detected='true'])" $REPORT)
-            TOTAL=$(xmllint --xpath "count(//mutation)" $REPORT)
-            if [ "$TOTAL" -gt 0 ]; then
-              SCORE=$((DETECTED * 100 / TOTAL))
-            else
-              SCORE=0
-            fi
-            echo "mutation_score=$SCORE" >> $GITHUB_OUTPUT
-          else
-            echo "mutation_score=0" >> $GITHUB_OUTPUT
-          fi
-
-      # ✅ Test Smells
-      - name: Run test smell detection
-        id: smells
-        run: |
-          cd base
-          if [[ "${{ github.event.inputs.language }}" == "java" ]]; then
-            pip install tsdetect
-            tsdetect --path src/test/java --report test-smells-report.json || true
-          else
-            curl -sSLO https://github.com/detekt/detekt/releases/download/v1.23.1/detekt-cli-1.23.1-all.jar
-            java -jar detekt-cli-1.23.1-all.jar -i src/test/kotlin -r json:test-smells-report.json || true
-          fi
-          COUNT=$(jq '.smells | length' test-smells-report.json 2>/dev/null || echo 0)
-          echo "smell_count=$COUNT" >> $GITHUB_OUTPUT
-
-      # ✅ Upload artifacts
-      - name: Upload artifacts
-        if: always()
+      - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
-          name: pr-analysis-results
+          name: test-reports
           path: |
-            base/**/build/reports/tests/**
-            base/**/target/surefire-reports/**
-            base/**/jacoco*.xml
-            base/**/mutation-report/**
-            base/test-smells-report.json
+            pr/**/build/reports/tests/**
+            pr/**/build/reports/jacoco/**
+            pr/**/build/reports/pitest/**
+            pr/**/build/reports/test-smells/**
 
-      # ✅ Summary with ALL metrics
-      - name: Generate summary report
+      - name: Generate summary
+        id: summary
         run: |
-          echo "## 📊 PR Analysis Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Compilation time: ${{ steps.compile.outputs.compilation_time }}s" >> $GITHUB_STEP_SUMMARY
-          echo "- 🧪 Test execution time: ${{ steps.tests.outputs.test_time }}s" >> $GITHUB_STEP_SUMMARY
-          echo "- 📈 Coverage: ${{ steps.coverage.outputs.coverage }}%" >> $GITHUB_STEP_SUMMARY
-          echo "- 🧬 Mutation Score: ${{ steps.mutation_score.outputs.mutation_score }}%" >> $GITHUB_STEP_SUMMARY
-          echo "- 🕵️ Test Smells Detected: ${{ steps.smells.outputs.smell_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📂 Full reports available in workflow artifacts." >> $GITHUB_STEP_SUMMARY
+          echo "📊 Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Compilation: ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- Execution: ✅" >> $GITHUB_STEP_SUMMARY
 
-      # ✅ Comment on PR
-      - name: Post PR comment
-        if: always()
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          header: pr-analysis-summary
-          message: |
-            📊 **Java/Kotlin PR Analysis**
-            - ✅ Compilation: ${{ steps.compile.outputs.compilation_time }}s
-            - 🧪 Tests: ${{ steps.tests.outputs.test_time }}s
-            - 📈 Coverage: ${{ steps.coverage.outputs.coverage }}%
-            - 🧬 Mutation Score: ${{ steps.mutation_score.outputs.mutation_score }}%
-            - 🕵️ Test Smells: ${{ steps.smells.outputs.smell_count }}
-            - 📂 Full detailed reports uploaded as artifacts
+          # Coverage
+          COV_FILE=$(find pr -name 'jacocoTestReport.xml' | head -n 1)
+          if [ -f "$COV_FILE" ]; then
+            COV=$(grep -o 'line-rate="[0-9.]*"' "$COV_FILE" | head -n 1 | cut -d'"' -f2)
+            echo "- Coverage: ${COV}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Coverage: ❌ Not found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Mutation
+          if [ -f pr/build/reports/pitest/index.html ]; then
+            echo "- Mutation: ✅ Report generated" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Mutation: ❌ No report" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Test Smells
+          if [ -f pr/build/reports/test-smells/test-smells-report.json ]; then
+            echo "- Test Smells: ✅ Report generated" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Test Smells: ❌ No report" >> $GITHUB_STEP_SUMMARY
+          fi
 
