@@ -53,13 +53,7 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
-          cache: 'gradle'
-
-      - name: Setup Kotlin
-        run: |
-          curl -s https://get.sdkman.io | bash
-          source "$HOME/.sdkman/bin/sdkman-init.sh"
-          sdk install kotlin
+          cache: 'maven'  # Cache Maven repository for both build systems
 
       - name: Get PR information
         id: pr_info
@@ -88,6 +82,16 @@ jobs:
             exit 1
           fi
 
+      - name: Detect Gradle DSL
+        id: detect_dsl
+        if: steps.detect_build.outputs.build_system == 'gradle'
+        run: |
+          if [ -f "build.gradle.kts" ]; then
+            echo "gradle_dsl=kts" >> $GITHUB_OUTPUT
+          else
+            echo "gradle_dsl=groovy" >> $GITHUB_OUTPUT
+          fi
+
       - name: Setup Gradle
         if: steps.detect_build.outputs.build_system == 'gradle'
         uses: gradle/actions/setup-gradle@v3
@@ -107,7 +111,7 @@ jobs:
           echo "🔍 Identifying changed test files in PR..."
           git diff --name-only ${{ steps.pr_info.outputs.base_sha }}..${{ steps.pr_info.outputs.head_sha }} | \
             grep -E '\.(java|kt)$' | \
-            grep -E '(test|spec)' > changed_tests.txt || true
+            grep -iE '(test|spec)' > changed_tests.txt || true
           
           if [ -s changed_tests.txt ]; then
             echo "found_tests=true" >> $GITHUB_OUTPUT
@@ -167,31 +171,15 @@ jobs:
           
           mkdir -p test-results
           
+          TEST_CLASSES=$(cat changed_tests.txt | sed -E 's|src/(test|it)/(java|kotlin)/||; s|/|.|g; s/\.(java|kt)$//')
+          TEST_CLASSES_LIST=$(echo "$TEST_CLASSES" | tr '\n' ' ')
+          TEST_CLASSES_COMMA=$(echo "$TEST_CLASSES" | tr '\n' ',')
+          
           if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
-            # Create custom gradle task for specific tests
-            cat >> build.gradle << 'EOF'
-          task runSpecificTests(type: Test) {
-              def testFiles = file('changed_tests.txt').readLines()
-              testFiles.each { file ->
-                  def className = file.replaceAll('/', '.').replaceAll('\\.java$|\\.kt$', '')
-                  include "**/${className.split('\\.')[-1]}.*"
-              }
-              testLogging {
-                  events "passed", "skipped", "failed"
-                  exceptionFormat "full"
-              }
-              reports {
-                  junitXml.enabled = true
-                  html.enabled = true
-              }
-          }
-          EOF
-            ./gradlew runSpecificTests jacocoTestReport 2>&1 | tee test_execution.log
+            ./gradlew test jacocoTestReport --tests "$TEST_CLASSES_LIST" 2>&1 | tee test_execution.log
             TEST_STATUS=${PIPESTATUS[0]}
           else
-            # Maven with specific test classes
-            TEST_CLASSES=$(cat changed_tests.txt | sed 's/.*\///g' | sed 's/\..*//' | tr '\n' ',')
-            mvn test -Dtest="$TEST_CLASSES" jacoco:report 2>&1 | tee test_execution.log
+            mvn jacoco:prepare-agent test jacoco:report -Dtest="$TEST_CLASSES_COMMA" 2>&1 | tee test_execution.log
             TEST_STATUS=${PIPESTATUS[0]}
           fi
           
@@ -279,29 +267,53 @@ jobs:
           echo "🧬 Running mutation testing with PIT..."
           
           if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
-            # Add PIT plugin to gradle
-            cat >> build.gradle << 'EOF'
-          plugins {
-              id 'info.solidsoft.pitest' version '1.15.0'
-          }
-          pitest {
-              targetClasses = ['com.*', 'org.*']
-              pitestVersion = '1.15.2'
-              threads = 4
-              outputFormats = ['XML', 'HTML']
-              timestampedReports = false
-          }
-          EOF
-            ./gradlew pitest 2>&1 | tee mutation.log
+            # Use init script to apply PITest without modifying build file
+            cat > pitest-init.gradle << 'EOF'
+            initscript {
+                repositories {
+                    mavenCentral()
+                }
+                dependencies {
+                    classpath 'info.solidsoft.gradle.pitest:gradle-pitest-plugin:1.15.0'
+                }
+            }
+            allprojects {
+                apply plugin: 'info.solidsoft.pitest'
+                pitest {
+                    pitestVersion = '1.15.2'
+                    threads = 4
+                    outputFormats = ['XML', 'HTML']
+                    timestampedReports = false
+                    targetClasses = ['*.*']  // More flexible: all classes
+                }
+            }
+            EOF
+            ./gradlew pitest --init-script pitest-init.gradle 2>&1 | tee mutation.log
             MUTATION_REPORT="build/reports/pitest/index.html"
+            MUTATION_XML="build/reports/pitest/mutations.xml"
           else
-            # Add PIT plugin to maven
             mvn org.pitest:pitest-maven:mutationCoverage 2>&1 | tee mutation.log
             MUTATION_REPORT="target/pit-reports/index.html"
+            MUTATION_XML="target/pit-reports/mutations.xml"
           fi
           
-          # Extract mutation score
-          MUTATION_SCORE=$(grep -oP 'mutations? killed.+?(\d+)%' mutation.log | grep -oP '\d+' | tail -1 || echo "0")
+          # Extract mutation score from XML
+          if [ -f "$MUTATION_XML" ]; then
+            MUTATION_SCORE=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$MUTATION_XML')
+          root = tree.getroot()
+          killed = 0
+          total = 0
+          for mutation in root.findall('.//mutation'):
+              total += 1
+              if mutation.get('status') == 'KILLED':
+                  killed += 1
+          print(int((killed / total * 100) if total > 0 else 0))
+          ")
+          else
+            MUTATION_SCORE=0
+          fi
           echo "mutation_score=$MUTATION_SCORE" >> $GITHUB_OUTPUT
           echo "✅ Mutation testing score: $MUTATION_SCORE%"
 
@@ -558,10 +570,10 @@ jobs:
               for smell, count in data['smells'].items():
                   icon = '⚠️' if count > 0 else '✅'
                   print(f'| {smell.replace(\"_\", \" \").title()} | {count} {icon} |')
-          "
+          " >> summary_report.md
           else
-            echo "| No analysis available | - |"
-          fi >> summary_report.md
+            echo "| No analysis available | - |" >> summary_report.md
+          fi
           
           cat >> summary_report.md << EOF
           | **Total Smells** | **${{ steps.test_smells.outputs.total_smells }}** |
@@ -572,7 +584,7 @@ jobs:
           |-------|----------|
           | Compilation | ${{ steps.compile_base.outputs.compilation_time }}s |
           | Test Execution | ${{ steps.run_tests.outputs.test_time }}s |
-          | Total Analysis | $(( ${steps.compile_base.outputs.compilation_time} + ${steps.run_tests.outputs.test_time} ))s |
+          | Total Analysis | $(( ${steps.compile_base.outputs.compilation_time:-0} + ${steps.run_tests.outputs.test_time:-0} ))s |
           
           ## 📝 Changed Test Files
           
@@ -593,7 +605,7 @@ jobs:
           EOF
           
           # Calculate overall quality score
-          python3 -c "
+          QUALITY_OUTPUT=$(python3 -c "
           compilation = 1 if '${{ steps.compile_base.outputs.compilation_status }}' == '0' else 0
           test_success = float('${{ steps.run_tests.outputs.tests_passed }}') / max(float('${{ steps.run_tests.outputs.tests_run }}'), 1) if '${{ steps.run_tests.outputs.tests_run }}' != '0' else 0
           coverage = (float('${{ steps.coverage.outputs.line_coverage }}') + float('${{ steps.coverage.outputs.branch_coverage }}')) / 200
@@ -612,11 +624,26 @@ jobs:
           print(f'- Code Coverage: {coverage * 25:.1f}/25')
           print(f'- Mutation Testing: {mutation * 20:.1f}/20')
           print(f'- Code Quality: {smells * 10:.1f}/10')
-          " >> summary_report.md
+          ")
+          echo "$QUALITY_OUTPUT" >> summary_report.md
           
           echo "" >> summary_report.md
           echo "---" >> summary_report.md
           echo "_Generated by PR Test Analysis Workflow_" >> summary_report.md
+          
+          # Create metrics.json for HTML report
+          SUCCESS_RATE=$([[ "${{ steps.run_tests.outputs.tests_run }}" != "0" ]] && echo "scale=2; ${{ steps.run_tests.outputs.tests_passed }} * 100 / ${{ steps.run_tests.outputs.tests_run }}" | bc || echo "0")
+          cat > metrics.json << EOF
+          {
+            "tests_passed": "${{ steps.run_tests.outputs.tests_passed }}",
+            "tests_run": "${{ steps.run_tests.outputs.tests_run }}",
+            "line_coverage": "${{ steps.coverage.outputs.line_coverage }}",
+            "branch_coverage": "${{ steps.coverage.outputs.branch_coverage }}",
+            "mutation_score": "${{ steps.mutation.outputs.mutation_score }}",
+            "total_smells": "${{ steps.test_smells.outputs.total_smells }}",
+            "success_rate": "$SUCCESS_RATE"
+          }
+          EOF
           
           echo "✅ Summary report generated successfully"
 
@@ -629,6 +656,7 @@ jobs:
             reports/
             summary_report.md
             test_smells.json
+            metrics.json
             compile_base.log
             test_execution.log
             mutation.log
@@ -751,6 +779,7 @@ jobs:
       
       - name: Generate HTML report
         run: |
+          # Create base HTML template
           cat > index.html << 'EOF'
           <!DOCTYPE html>
           <html lang="en">
@@ -892,19 +921,19 @@ jobs:
                   <div class="content">
                       <div class="metrics-grid">
                           <div class="metric-card">
-                              <div class="metric-value">--</div>
+                              <div class="metric-value" id="tests-passed">--</div>
                               <div class="metric-label">Tests Passed</div>
                           </div>
                           <div class="metric-card">
-                              <div class="metric-value">--%</div>
+                              <div class="metric-value" id="code-coverage">--%</div>
                               <div class="metric-label">Code Coverage</div>
                           </div>
                           <div class="metric-card">
-                              <div class="metric-value">--%</div>
+                              <div class="metric-value" id="mutation-score">--%</div>
                               <div class="metric-label">Mutation Score</div>
                           </div>
                           <div class="metric-card">
-                              <div class="metric-value">--</div>
+                              <div class="metric-value" id="test-smells">--</div>
                               <div class="metric-label">Test Smells</div>
                           </div>
                       </div>
@@ -912,7 +941,7 @@ jobs:
                       <div class="section">
                           <h2>📊 Test Results</h2>
                           <div class="progress-bar">
-                              <div class="progress-fill" style="width: 0%">0%</div>
+                              <div class="progress-fill" id="progress-fill" style="width: 0%">0%</div>
                           </div>
                       </div>
                       
@@ -929,13 +958,13 @@ jobs:
                               <tbody>
                                   <tr>
                                       <td>Line Coverage</td>
-                                      <td>--%</td>
-                                      <td><span class="status-badge status-warning">Pending</span></td>
+                                      <td id="line-coverage">--%</td>
+                                      <td id="line-status"><span class="status-badge status-warning">Pending</span></td>
                                   </tr>
                                   <tr>
                                       <td>Branch Coverage</td>
-                                      <td>--%</td>
-                                      <td><span class="status-badge status-warning">Pending</span></td>
+                                      <td id="branch-coverage">--%</td>
+                                      <td id="branch-status"><span class="status-badge status-warning">Pending</span></td>
                                   </tr>
                               </tbody>
                           </table>
@@ -966,7 +995,7 @@ jobs:
               </div>
               
               <script>
-                  // Populate with actual data from artifacts
+                  // Populate with actual data
                   document.addEventListener('DOMContentLoaded', function() {
                       // Animation for progress bars and metrics
                       setTimeout(() => {
@@ -981,7 +1010,69 @@ jobs:
           </html>
           EOF
           
-          echo "✅ HTML report generated"
+          # Populate HTML using Python
+          cat > populate_html.py << 'EOF'
+          import json
+          import sys
+          import re
+          
+          def get_status(percentage):
+              perc = float(percentage)
+              if perc >= 80:
+                  return 'success', '✅ Good'
+              elif perc >= 60:
+                  return 'warning', '⚠️ Moderate'
+              else:
+                  return 'failure', '❌ Low'
+          
+          # Load data
+          with open('artifacts/test-analysis-reports/metrics.json', 'r') as f:
+              metrics = json.load(f)
+          
+          with open('artifacts/test-analysis-reports/test_smells.json', 'r') as f:
+              smells_data = json.load(f)
+          
+          # Load HTML
+          with open('index.html', 'r') as f:
+              html = f.read()
+          
+          # Replace metrics
+          html = re.sub(r'id="tests-passed">[^<]+', f'id="tests-passed">{metrics["tests_passed"]}', html)
+          avg_coverage = (float(metrics["line_coverage"]) + float(metrics["branch_coverage"])) / 2
+          html = re.sub(r'id="code-coverage">[^<]+', f'id="code-coverage">{avg_coverage:.2f}%', html)
+          html = re.sub(r'id="mutation-score">[^<]+', f'id="mutation-score">{metrics["mutation_score"]}%', html)
+          html = re.sub(r'id="test-smells">[^<]+', f'id="test-smells">{metrics["total_smells"]}', html)
+          
+          # Progress bar
+          html = re.sub(r'style="width: 0%', f'style="width: {metrics["success_rate"]}%', html)
+          html = re.sub(r'>0%</div>', f'>{metrics["success_rate"]}%</div>', html)
+          
+          # Coverage table
+          html = re.sub(r'id="line-coverage">[^<]+', f'id="line-coverage">{metrics["line_coverage"]}%', html)
+          html = re.sub(r'id="branch-coverage">[^<]+', f'id="branch-coverage">{metrics["branch_coverage"]}%', html)
+          
+          line_class, line_text = get_status(metrics["line_coverage"])
+          branch_class, branch_text = get_status(metrics["branch_coverage"])
+          
+          html = re.sub(r'id="line-status"><span [^>]+>[^<]+</span>', f'id="line-status"><span class="status-badge status-{line_class}">{line_text}</span>', html)
+          html = re.sub(r'id="branch-status"><span [^>]+>[^<]+</span>', f'id="branch-status"><span class="status-badge status-{branch_class}">{branch_text}</span>', html)
+          
+          # Smells table
+          smells_rows = ''
+          for smell, count in smells_data['smells'].items():
+              severity_class, severity_text = get_status(100 - (count * 10)) if count > 0 else ('success', '✅ None')
+              smells_rows += f'<tr><td>{smell.replace("_", " ").title()}</td><td>{count}</td><td><span class="status-badge status-{severity_class}">{severity_text}</span></td></tr>'
+          
+          html = re.sub(r'<tbody id="smells-table">.*?</tbody>', f'<tbody id="smells-table">{smells_rows}</tbody>', html, flags=re.DOTALL)
+          
+          # Write updated HTML
+          with open('index.html', 'w') as f:
+              f.write(html)
+          EOF
+          
+          python3 populate_html.py
+          
+          echo "✅ HTML report generated and populated"
 
       - name: Upload HTML report
         uses: actions/upload-artifact@v4
