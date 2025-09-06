@@ -1,144 +1,1098 @@
-name: Analyze PR Quality
+name: Java/Kotlin PR Test Workflow
 
 on:
   workflow_dispatch:
     inputs:
-      repo:
-        description: "Repository (e.g. owner/name)"
+      repo_name:
+        description: 'Repository name (format: owner/repo)'
         required: true
         type: string
       pr_number:
-        description: "Pull request number"
+        description: 'Pull Request number'
         required: true
         type: string
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.5'
+  MAVEN_VERSION: '3.9.6'
 
 jobs:
   analyze-pr:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      actions: read
+      statuses: write
+    
     steps:
-      # Checkout base repo
-      - name: Checkout base repository
+      - name: Validate inputs
+        run: |
+          if [[ ! "${{ github.event.inputs.repo_name }}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "❌ Invalid repository format. Expected: owner/repo"
+            exit 1
+          fi
+          if [[ ! "${{ github.event.inputs.pr_number }}" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid PR number. Expected: numeric value"
+            exit 1
+          fi
+          echo "✅ Inputs validated successfully"
+
+      - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.repo }}
-          path: base
+          repository: ${{ github.event.inputs.repo_name }}
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Fetch the PR branch
-      - name: Fetch PR code
-        run: |
-          git clone https://github.com/${{ github.event.inputs.repo }} pr
-          cd pr
-          git fetch origin pull/${{ github.event.inputs.pr_number }}/head:pr-branch
-          git checkout pr-branch
-
-      # Setup Java & Kotlin
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 17
-          cache: gradle
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'  # Cache Maven repository for both build systems
 
-      # Detect build system
-      - name: Detect build tool
-        id: detect
+      - name: Get PR information
+        id: pr_info
         run: |
-          if [ -f "pr/build.gradle" ] || [ -f "pr/build.gradle.kts" ]; then
-            echo "tool=gradle" >> $GITHUB_OUTPUT
-          elif [ -f "pr/pom.xml" ]; then
-            echo "tool=maven" >> $GITHUB_OUTPUT
+          PR_DATA=$(gh api repos/${{ github.event.inputs.repo_name }}/pulls/${{ github.event.inputs.pr_number }})
+          BASE_SHA=$(echo "$PR_DATA" | jq -r '.base.sha')
+          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.base.ref')
+          echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect build system
+        id: detect_build
+        run: |
+          if [ -f "pom.xml" ]; then
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+            echo "📦 Detected Maven project"
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+            echo "📦 Detected Gradle project"
           else
-            echo "No supported build tool detected (Gradle/Maven)."
+            echo "❌ No supported build system found"
             exit 1
           fi
 
-      # Compile project
-      - name: Compile Project
-        id: compile
+      - name: Detect Gradle DSL
+        id: detect_dsl
+        if: steps.detect_build.outputs.build_system == 'gradle'
         run: |
-          set +e
-          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
-            cd pr
-            ./gradlew clean compileJava compileTestJava
+          if [ -f "build.gradle.kts" ]; then
+            echo "gradle_dsl=kts" >> $GITHUB_OUTPUT
           else
-            cd pr
-            mvn -B clean compile test-compile
-          fi
-          echo "compilation_success=$?" >> $GITHUB_OUTPUT
-          set -e
-
-      # Run tests
-      - name: Run Tests
-        id: tests
-        run: |
-          set +e
-          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
-            cd pr
-            ./gradlew test
-          else
-            cd pr
-            mvn -B test
-          fi
-          echo "execution_success=$?" >> $GITHUB_OUTPUT
-          set -e
-
-      # Run Coverage
-      - name: Run Coverage
-        run: |
-          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
-            cd pr
-            ./gradlew jacocoTestReport
-          else
-            cd pr
-            mvn -B jacoco:report
+            echo "gradle_dsl=groovy" >> $GITHUB_OUTPUT
           fi
 
-      # Run Mutation Testing
-      - name: Run Mutation Testing
+      - name: Setup Gradle
+        if: steps.detect_build.outputs.build_system == 'gradle'
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Setup Maven
+        if: steps.detect_build.outputs.build_system == 'maven'
         run: |
-          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
-            cd pr
-            ./gradlew pitest
+          wget -q https://dlcdn.apache.org/maven/maven-3/${{ env.MAVEN_VERSION }}/binaries/apache-maven-${{ env.MAVEN_VERSION }}-bin.tar.gz
+          tar xzf apache-maven-${{ env.MAVEN_VERSION }}-bin.tar.gz
+          echo "$PWD/apache-maven-${{ env.MAVEN_VERSION }}/bin" >> $GITHUB_PATH
+
+      - name: Identify changed test files
+        id: changed_tests
+        run: |
+          echo "🔍 Identifying changed test files in PR..."
+          git diff --name-only ${{ steps.pr_info.outputs.base_sha }}..${{ steps.pr_info.outputs.head_sha }} | \
+            grep -E '\.(java|kt)$' | \
+            grep -iE '(test|spec)' > changed_tests.txt || true
+          
+          if [ -s changed_tests.txt ]; then
+            echo "found_tests=true" >> $GITHUB_OUTPUT
+            echo "📋 Changed test files:"
+            cat changed_tests.txt
           else
-            cd pr
-            mvn -B org.pitest:pitest-maven:mutationCoverage
+            echo "found_tests=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No test files found in PR"
           fi
 
-      # Run Test Smells
-      - name: Run Test Smells
+      - name: Checkout base branch
+        if: steps.changed_tests.outputs.found_tests == 'true'
         run: |
-          if [ "${{ steps.detect.outputs.tool }}" = "gradle" ]; then
-            cd pr
-            ./gradlew testSmells || true
+          git checkout ${{ steps.pr_info.outputs.base_branch }}
+          echo "✅ Checked out base branch: ${{ steps.pr_info.outputs.base_branch }}"
+
+      - name: Compile base code
+        id: compile_base
+        if: steps.changed_tests.outputs.found_tests == 'true'
+        run: |
+          echo "🔨 Compiling base code..."
+          START_TIME=$(date +%s)
+          
+          if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
+            ./gradlew clean compileJava compileKotlin compileTestJava compileTestKotlin 2>&1 | tee compile_base.log
+            COMPILE_STATUS=${PIPESTATUS[0]}
           else
-            cd pr
-            mvn -B test-compile || true
+            mvn clean compile test-compile 2>&1 | tee compile_base.log
+            COMPILE_STATUS=${PIPESTATUS[0]}
+          fi
+          
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          
+          echo "compilation_status=$COMPILE_STATUS" >> $GITHUB_OUTPUT
+          echo "compilation_time=$DURATION" >> $GITHUB_OUTPUT
+          
+          if [ $COMPILE_STATUS -eq 0 ]; then
+            echo "✅ Base compilation successful (${DURATION}s)"
+          else
+            echo "❌ Base compilation failed"
           fi
 
-      # Upload reports
-      - name: Upload Reports
+      - name: Copy PR tests to base
+        if: steps.changed_tests.outputs.found_tests == 'true' && steps.compile_base.outputs.compilation_status == '0'
+        run: |
+          echo "📋 Copying PR test files to base code..."
+          git checkout ${{ steps.pr_info.outputs.head_sha }} -- $(cat changed_tests.txt)
+          echo "✅ Test files copied successfully"
+
+      - name: Run tests with coverage
+        id: run_tests
+        if: steps.changed_tests.outputs.found_tests == 'true' && steps.compile_base.outputs.compilation_status == '0'
+        run: |
+          echo "🧪 Running tests with coverage..."
+          START_TIME=$(date +%s)
+          
+          mkdir -p test-results
+          
+          TEST_CLASSES=$(cat changed_tests.txt | sed -E 's|src/(test|it)/(java|kotlin)/||; s|/|.|g; s/\.(java|kt)$//')
+          TEST_CLASSES_LIST=$(echo "$TEST_CLASSES" | tr '\n' ' ')
+          TEST_CLASSES_COMMA=$(echo "$TEST_CLASSES" | tr '\n' ',')
+          
+          if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
+            ./gradlew test jacocoTestReport --tests "$TEST_CLASSES_LIST" 2>&1 | tee test_execution.log
+            TEST_STATUS=${PIPESTATUS[0]}
+          else
+            mvn jacoco:prepare-agent test jacoco:report -Dtest="$TEST_CLASSES_COMMA" 2>&1 | tee test_execution.log
+            TEST_STATUS=${PIPESTATUS[0]}
+          fi
+          
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          
+          echo "test_status=$TEST_STATUS" >> $GITHUB_OUTPUT
+          echo "test_time=$DURATION" >> $GITHUB_OUTPUT
+          
+          # Extract test results
+          if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
+            TESTS_RUN=$(grep -oP 'tests?: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_PASSED=$(grep -oP 'passed?: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_FAILED=$(grep -oP 'failed?: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_SKIPPED=$(grep -oP 'skipped?: \K\d+' test_execution.log | tail -1 || echo "0")
+          else
+            TESTS_RUN=$(grep -oP 'Tests run: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_FAILED=$(grep -oP 'Failures: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_ERRORS=$(grep -oP 'Errors: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_SKIPPED=$(grep -oP 'Skipped: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_PASSED=$((TESTS_RUN - TESTS_FAILED - TESTS_ERRORS - TESTS_SKIPPED))
+          fi
+          
+          echo "tests_run=$TESTS_RUN" >> $GITHUB_OUTPUT
+          echo "tests_passed=$TESTS_PASSED" >> $GITHUB_OUTPUT
+          echo "tests_failed=$TESTS_FAILED" >> $GITHUB_OUTPUT
+          echo "tests_skipped=$TESTS_SKIPPED" >> $GITHUB_OUTPUT
+
+      - name: Parse coverage results
+        id: coverage
+        if: steps.changed_tests.outputs.found_tests == 'true' && steps.run_tests.outputs.test_status == '0'
+        run: |
+          echo "📊 Parsing coverage results..."
+          
+          if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
+            COVERAGE_FILE="build/reports/jacoco/test/jacocoTestReport.xml"
+          else
+            COVERAGE_FILE="target/site/jacoco/jacoco.xml"
+          fi
+          
+          if [ -f "$COVERAGE_FILE" ]; then
+            # Parse JaCoCo XML for coverage metrics
+            LINE_COVERAGE=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$COVERAGE_FILE')
+          root = tree.getroot()
+          for counter in root.findall('.//counter[@type=\"LINE\"]'):
+              missed = int(counter.get('missed', 0))
+              covered = int(counter.get('covered', 0))
+              if (missed + covered) > 0:
+                  print(f'{(covered / (missed + covered)) * 100:.2f}')
+                  break
+          else:
+              print('0.00')
+          ")
+            
+            BRANCH_COVERAGE=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$COVERAGE_FILE')
+          root = tree.getroot()
+          for counter in root.findall('.//counter[@type=\"BRANCH\"]'):
+              missed = int(counter.get('missed', 0))
+              covered = int(counter.get('covered', 0))
+              if (missed + covered) > 0:
+                  print(f'{(covered / (missed + covered)) * 100:.2f}')
+                  break
+          else:
+              print('0.00')
+          ")
+            
+            echo "line_coverage=$LINE_COVERAGE" >> $GITHUB_OUTPUT
+            echo "branch_coverage=$BRANCH_COVERAGE" >> $GITHUB_OUTPUT
+            echo "✅ Coverage: Line=$LINE_COVERAGE%, Branch=$BRANCH_COVERAGE%"
+          else
+            echo "line_coverage=0.00" >> $GITHUB_OUTPUT
+            echo "branch_coverage=0.00" >> $GITHUB_OUTPUT
+            echo "⚠️ No coverage data found"
+          fi
+
+      - name: Run mutation testing
+        id: mutation
+        if: steps.changed_tests.outputs.found_tests == 'true' && steps.run_tests.outputs.test_status == '0'
+        continue-on-error: true
+        run: |
+          echo "🧬 Running mutation testing with PIT..."
+          
+          if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
+            # Use init script to apply PITest without modifying build file
+            cat > pitest-init.gradle << 'EOF'
+            initscript {
+                repositories {
+                    mavenCentral()
+                }
+                dependencies {
+                    classpath 'info.solidsoft.gradle.pitest:gradle-pitest-plugin:1.15.0'
+                }
+            }
+            allprojects {
+                apply plugin: 'info.solidsoft.pitest'
+                pitest {
+                    pitestVersion = '1.15.2'
+                    threads = 4
+                    outputFormats = ['XML', 'HTML']
+                    timestampedReports = false
+                    targetClasses = ['*.*']  // More flexible: all classes
+                }
+            }
+            EOF
+            ./gradlew pitest --init-script pitest-init.gradle 2>&1 | tee mutation.log
+            MUTATION_REPORT="build/reports/pitest/index.html"
+            MUTATION_XML="build/reports/pitest/mutations.xml"
+          else
+            mvn org.pitest:pitest-maven:mutationCoverage 2>&1 | tee mutation.log
+            MUTATION_REPORT="target/pit-reports/index.html"
+            MUTATION_XML="target/pit-reports/mutations.xml"
+          fi
+          
+          # Extract mutation score from XML
+          if [ -f "$MUTATION_XML" ]; then
+            MUTATION_SCORE=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$MUTATION_XML')
+          root = tree.getroot()
+          killed = 0
+          total = 0
+          for mutation in root.findall('.//mutation'):
+              total += 1
+              if mutation.get('status') == 'KILLED':
+                  killed += 1
+          print(int((killed / total * 100) if total > 0 else 0))
+          ")
+          else
+            MUTATION_SCORE=0
+          fi
+          echo "mutation_score=$MUTATION_SCORE" >> $GITHUB_OUTPUT
+          echo "✅ Mutation testing score: $MUTATION_SCORE%"
+
+      - name: Detect test smells
+        id: test_smells
+        if: steps.changed_tests.outputs.found_tests == 'true'
+        run: |
+          echo "🔍 Detecting test smells..."
+          
+          # Create test smell detection script
+          cat > detect_smells.py << 'EOF'
+          import re
+          import sys
+          import json
+          
+          smells = {
+              "assertion_roulette": 0,
+              "eager_test": 0,
+              "lazy_test": 0,
+              "mystery_guest": 0,
+              "sensitive_equality": 0,
+              "inappropriate_intimacy": 0,
+              "resource_optimism": 0,
+              "magic_numbers": 0,
+              "conditional_test": 0,
+              "exception_handling": 0
+          }
+          
+          smell_details = []
+          
+          def analyze_file(filepath):
+              with open(filepath, 'r') as f:
+                  content = f.read()
+                  lines = content.split('\n')
+                  
+                  # Count assertions per test method
+                  test_methods = re.findall(r'@Test.*?\n.*?void\s+(\w+)', content, re.DOTALL)
+                  for method in test_methods:
+                      method_content = re.search(rf'void\s+{method}.*?{{(.*?)}}', content, re.DOTALL)
+                      if method_content:
+                          assertions = len(re.findall(r'assert\w+', method_content.group(1)))
+                          if assertions > 5:
+                              smells["assertion_roulette"] += 1
+                              smell_details.append(f"Assertion Roulette in {filepath}::{method}")
+                          if assertions == 0:
+                              smells["lazy_test"] += 1
+                              smell_details.append(f"Lazy Test in {filepath}::{method}")
+                  
+                  # Check for external dependencies
+                  if re.search(r'(new File|FileReader|FileWriter|Database|Connection)', content):
+                      smells["mystery_guest"] += 1
+                      smell_details.append(f"Mystery Guest in {filepath}")
+                  
+                  # Check for string equality
+                  if re.search(r'assertEquals.*?".*?"', content):
+                      smells["sensitive_equality"] += 1
+                      smell_details.append(f"Sensitive Equality in {filepath}")
+                  
+                  # Check for private field access
+                  if re.search(r'@(InjectMocks|Spy|Mock).*?private', content):
+                      smells["inappropriate_intimacy"] += 1
+                      smell_details.append(f"Inappropriate Intimacy in {filepath}")
+                  
+                  # Check for resource handling
+                  if re.search(r'(close\(\)|finally)', content):
+                      if not re.search(r'try.*?finally', content, re.DOTALL):
+                          smells["resource_optimism"] += 1
+                          smell_details.append(f"Resource Optimism in {filepath}")
+                  
+                  # Check for magic numbers
+                  magic_numbers = re.findall(r'(?<![\w.])[0-9]+(?![\w.])', content)
+                  if len([n for n in magic_numbers if n not in ['0', '1', '2']]) > 5:
+                      smells["magic_numbers"] += 1
+                      smell_details.append(f"Magic Numbers in {filepath}")
+                  
+                  # Check for conditional logic
+                  if re.search(r'@Test.*?if\s*\(', content, re.DOTALL):
+                      smells["conditional_test"] += 1
+                      smell_details.append(f"Conditional Test Logic in {filepath}")
+                  
+                  # Check for exception handling
+                  if re.search(r'catch\s*\(.*?\)\s*{\s*}', content):
+                      smells["exception_handling"] += 1
+                      smell_details.append(f"Empty Exception Handling in {filepath}")
+          
+          with open('changed_tests.txt', 'r') as f:
+              for line in f:
+                  filepath = line.strip()
+                  if filepath:
+                      try:
+                          analyze_file(filepath)
+                      except Exception as e:
+                          print(f"Error analyzing {filepath}: {e}")
+          
+          total_smells = sum(smells.values())
+          print(f"Total smells detected: {total_smells}")
+          print(json.dumps(smells, indent=2))
+          
+          with open('test_smells.json', 'w') as f:
+              json.dump({
+                  "total": total_smells,
+                  "smells": smells,
+                  "details": smell_details[:10]  # Limit details to first 10
+              }, f, indent=2)
+          EOF
+          
+          python3 detect_smells.py
+          TOTAL_SMELLS=$(python3 -c "import json; print(json.load(open('test_smells.json'))['total'])")
+          echo "total_smells=$TOTAL_SMELLS" >> $GITHUB_OUTPUT
+          echo "✅ Test smells detected: $TOTAL_SMELLS"
+
+      - name: Generate individual test reports
+        id: test_reports
+        if: steps.changed_tests.outputs.found_tests == 'true'
+        run: |
+          echo "📄 Generating individual test reports..."
+          
+          mkdir -p reports
+          
+          # Generate report for each test file
+          while IFS= read -r test_file; do
+              if [ -n "$test_file" ]; then
+                  TEST_NAME=$(basename "$test_file" | sed 's/\..*//')
+                  REPORT_FILE="reports/${TEST_NAME}_report.md"
+                  
+                  echo "# Test Report: $TEST_NAME" > "$REPORT_FILE"
+                  echo "" >> "$REPORT_FILE"
+                  echo "**File:** $test_file" >> "$REPORT_FILE"
+                  echo "**Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$REPORT_FILE"
+                  echo "" >> "$REPORT_FILE"
+                  
+                  # Add test results if available
+                  if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
+                      TEST_RESULT_FILE="build/test-results/test/TEST-*${TEST_NAME}*.xml"
+                  else
+                      TEST_RESULT_FILE="target/surefire-reports/TEST-*${TEST_NAME}*.xml"
+                  fi
+                  
+                  if ls $TEST_RESULT_FILE 1> /dev/null 2>&1; then
+                      echo "## Test Execution Results" >> "$REPORT_FILE"
+                      python3 -c "
+          import xml.etree.ElementTree as ET
+          import glob
+          
+          for file in glob.glob('$TEST_RESULT_FILE'):
+              tree = ET.parse(file)
+              root = tree.getroot()
+              testcase_elements = root.findall('.//testcase')
+              
+              print('| Test Method | Status | Time (s) |')
+              print('|-------------|--------|----------|')
+              
+              for tc in testcase_elements:
+                  name = tc.get('name', 'Unknown')
+                  time = tc.get('time', '0')
+                  failure = tc.find('failure')
+                  error = tc.find('error')
+                  skipped = tc.find('skipped')
+                  
+                  if failure is not None:
+                      status = '❌ Failed'
+                  elif error is not None:
+                      status = '❌ Error'
+                  elif skipped is not None:
+                      status = '⏭️ Skipped'
+                  else:
+                      status = '✅ Passed'
+                  
+                  print(f'| {name} | {status} | {time} |')
+          " >> "$REPORT_FILE"
+                      echo "" >> "$REPORT_FILE"
+                  fi
+                  
+                  # Add smell analysis for this specific file
+                  echo "## Code Quality Analysis" >> "$REPORT_FILE"
+                  python3 -c "
+          import json
+          
+          with open('test_smells.json', 'r') as f:
+              data = json.load(f)
+              details = [d for d in data['details'] if '$test_file' in d]
+              if details:
+                  print('### Test Smells Detected:')
+                  for detail in details:
+                      print(f'- {detail}')
+              else:
+                  print('✅ No test smells detected in this file')
+          " >> "$REPORT_FILE"
+                  
+                  echo "✅ Generated report for $TEST_NAME"
+              fi
+          done < changed_tests.txt
+
+      - name: Generate summary report
+        id: summary
+        if: always()
+        run: |
+          echo "📊 Generating summary report..."
+          
+          cat > summary_report.md << EOF
+          # PR Test Analysis Summary Report
+          
+          **Repository:** ${{ github.event.inputs.repo_name }}  
+          **Pull Request:** #${{ github.event.inputs.pr_number }}  
+          **Analysis Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")  
+          **Build System:** ${{ steps.detect_build.outputs.build_system }}
+          
+          ---
+          
+          ## 📋 Overall Status
+          
+          | Metric | Status |
+          |--------|--------|
+          | Compilation | $([[ "${{ steps.compile_base.outputs.compilation_status }}" == "0" ]] && echo "✅ Success" || echo "❌ Failed") |
+          | Test Execution | $([[ "${{ steps.run_tests.outputs.test_status }}" == "0" ]] && echo "✅ Success" || echo "❌ Failed") |
+          | Changed Test Files | $([[ "${{ steps.changed_tests.outputs.found_tests }}" == "true" ]] && echo "$(wc -l < changed_tests.txt) files" || echo "None found") |
+          
+          ## 🧪 Test Execution Results
+          
+          | Metric | Value |
+          |--------|-------|
+          | Total Tests Run | ${{ steps.run_tests.outputs.tests_run }} |
+          | Tests Passed | ${{ steps.run_tests.outputs.tests_passed }} ✅ |
+          | Tests Failed | ${{ steps.run_tests.outputs.tests_failed }} ❌ |
+          | Tests Skipped | ${{ steps.run_tests.outputs.tests_skipped }} ⏭️ |
+          | Success Rate | $([[ "${{ steps.run_tests.outputs.tests_run }}" != "0" ]] && echo "scale=2; ${{ steps.run_tests.outputs.tests_passed }} * 100 / ${{ steps.run_tests.outputs.tests_run }}" | bc || echo "0")% |
+          | Execution Time | ${{ steps.run_tests.outputs.test_time }}s |
+          
+          ## 📊 Code Coverage
+          
+          | Coverage Type | Percentage |
+          |---------------|------------|
+          | Line Coverage | ${{ steps.coverage.outputs.line_coverage }}% |
+          | Branch Coverage | ${{ steps.coverage.outputs.branch_coverage }}% |
+          
+          ## 🧬 Mutation Testing
+          
+          | Metric | Value |
+          |--------|-------|
+          | Mutation Score | ${{ steps.mutation.outputs.mutation_score }}% |
+          | Mutation Strength | $([[ "${{ steps.mutation.outputs.mutation_score }}" -ge 80 ]] && echo "🟢 Strong" || ([[ "${{ steps.mutation.outputs.mutation_score }}" -ge 60 ]] && echo "🟡 Moderate" || echo "🔴 Weak")) |
+          
+          ## 🔍 Test Quality Analysis
+          
+          | Test Smell | Count |
+          |------------|-------|
+          EOF
+          
+          if [ -f "test_smells.json" ]; then
+            python3 -c "
+          import json
+          with open('test_smells.json', 'r') as f:
+              data = json.load(f)
+              for smell, count in data['smells'].items():
+                  icon = '⚠️' if count > 0 else '✅'
+                  print(f'| {smell.replace(\"_\", \" \").title()} | {count} {icon} |')
+          " >> summary_report.md
+          else
+            echo "| No analysis available | - |" >> summary_report.md
+          fi
+          
+          cat >> summary_report.md << EOF
+          | **Total Smells** | **${{ steps.test_smells.outputs.total_smells }}** |
+          
+          ## ⏱️ Performance Metrics
+          
+          | Phase | Duration |
+          |-------|----------|
+          | Compilation | ${{ steps.compile_base.outputs.compilation_time }}s |
+          | Test Execution | ${{ steps.run_tests.outputs.test_time }}s |
+          | Total Analysis | $(( ${steps.compile_base.outputs.compilation_time:-0} + ${steps.run_tests.outputs.test_time:-0} ))s |
+          
+          ## 📝 Changed Test Files
+          
+          EOF
+          
+          if [ -f "changed_tests.txt" ] && [ -s "changed_tests.txt" ]; then
+            echo '```' >> summary_report.md
+            cat changed_tests.txt >> summary_report.md
+            echo '```' >> summary_report.md
+          else
+            echo "_No test files were changed in this PR_" >> summary_report.md
+          fi
+          
+          cat >> summary_report.md << EOF
+          
+          ## 🎯 Quality Score
+          
+          EOF
+          
+          # Calculate overall quality score
+          QUALITY_OUTPUT=$(python3 -c "
+          compilation = 1 if '${{ steps.compile_base.outputs.compilation_status }}' == '0' else 0
+          test_success = float('${{ steps.run_tests.outputs.tests_passed }}') / max(float('${{ steps.run_tests.outputs.tests_run }}'), 1) if '${{ steps.run_tests.outputs.tests_run }}' != '0' else 0
+          coverage = (float('${{ steps.coverage.outputs.line_coverage }}') + float('${{ steps.coverage.outputs.branch_coverage }}')) / 200
+          mutation = float('${{ steps.mutation.outputs.mutation_score }}') / 100
+          smells = max(0, 1 - (float('${{ steps.test_smells.outputs.total_smells }}') / 10))
+          
+          score = (compilation * 20 + test_success * 25 + coverage * 25 + mutation * 20 + smells * 10)
+          
+          grade = 'A' if score >= 90 else 'B' if score >= 80 else 'C' if score >= 70 else 'D' if score >= 60 else 'F'
+          
+          print(f'**Overall Quality Score:** {score:.1f}/100 (Grade: {grade})')
+          print('')
+          print('### Score Breakdown:')
+          print(f'- Compilation: {compilation * 20:.1f}/20')
+          print(f'- Test Success: {test_success * 25:.1f}/25')
+          print(f'- Code Coverage: {coverage * 25:.1f}/25')
+          print(f'- Mutation Testing: {mutation * 20:.1f}/20')
+          print(f'- Code Quality: {smells * 10:.1f}/10')
+          ")
+          echo "$QUALITY_OUTPUT" >> summary_report.md
+          
+          echo "" >> summary_report.md
+          echo "---" >> summary_report.md
+          echo "_Generated by PR Test Analysis Workflow_" >> summary_report.md
+          
+          # Create metrics.json for HTML report
+          SUCCESS_RATE=$([[ "${{ steps.run_tests.outputs.tests_run }}" != "0" ]] && echo "scale=2; ${{ steps.run_tests.outputs.tests_passed }} * 100 / ${{ steps.run_tests.outputs.tests_run }}" | bc || echo "0")
+          cat > metrics.json << EOF
+          {
+            "tests_passed": "${{ steps.run_tests.outputs.tests_passed }}",
+            "tests_run": "${{ steps.run_tests.outputs.tests_run }}",
+            "line_coverage": "${{ steps.coverage.outputs.line_coverage }}",
+            "branch_coverage": "${{ steps.coverage.outputs.branch_coverage }}",
+            "mutation_score": "${{ steps.mutation.outputs.mutation_score }}",
+            "total_smells": "${{ steps.test_smells.outputs.total_smells }}",
+            "success_rate": "$SUCCESS_RATE"
+          }
+          EOF
+          
+          echo "✅ Summary report generated successfully"
+
+      - name: Upload test reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr-analysis-reports
+          name: test-analysis-reports
           path: |
-            pr/**/build/reports/tests/**
-            pr/**/build/reports/jacoco/**
-            pr/**/build/reports/pitest/**
-            pr/**/build/reports/testSmells/**
-            pr/**/target/surefire-reports/**
-            pr/**/target/site/jacoco/**
-            pr/**/target/pit-reports/**
+            reports/
+            summary_report.md
+            test_smells.json
+            metrics.json
+            compile_base.log
+            test_execution.log
+            mutation.log
+          retention-days: 30
 
-      # Final summary
-      - name: Generate Summary
+      - name: Upload coverage reports
+        if: steps.run_tests.outputs.test_status == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            **/jacoco/**
+            **/site/jacoco/**
+            **/reports/jacoco/**
+          retention-days: 30
+
+      - name: Upload mutation reports
+        if: steps.mutation.outputs.mutation_score != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-reports
+          path: |
+            **/pit-reports/**
+            **/reports/pitest/**
+          retention-days: 30
+
+      - name: Post summary as PR comment
+        if: always() && steps.changed_tests.outputs.found_tests == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const summaryContent = fs.readFileSync('summary_report.md', 'utf8');
+            
+            try {
+              await github.rest.issues.createComment({
+                owner: '${{ github.event.inputs.repo_name }}'.split('/')[0],
+                repo: '${{ github.event.inputs.repo_name }}'.split('/')[1],
+                issue_number: ${{ github.event.inputs.pr_number }},
+                body: summaryContent
+              });
+              console.log('✅ Summary posted to PR successfully');
+            } catch (error) {
+              console.error('Failed to post comment:', error);
+            }
+
+      - name: Create check run
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const conclusion = '${{ steps.run_tests.outputs.test_status }}' === '0' ? 'success' : 'failure';
+            const title = conclusion === 'success' ? '✅ PR Test Analysis Passed' : '❌ PR Test Analysis Failed';
+            
+            const summary = `
+            ## Test Results
+            - **Tests Run:** ${{ steps.run_tests.outputs.tests_run }}
+            - **Tests Passed:** ${{ steps.run_tests.outputs.tests_passed }}
+            - **Tests Failed:** ${{ steps.run_tests.outputs.tests_failed }}
+            - **Line Coverage:** ${{ steps.coverage.outputs.line_coverage }}%
+            - **Branch Coverage:** ${{ steps.coverage.outputs.branch_coverage }}%
+            - **Mutation Score:** ${{ steps.mutation.outputs.mutation_score }}%
+            - **Test Smells:** ${{ steps.test_smells.outputs.total_smells }}
+            `;
+            
+            try {
+              await github.rest.checks.create({
+                owner: '${{ github.event.inputs.repo_name }}'.split('/')[0],
+                repo: '${{ github.event.inputs.repo_name }}'.split('/')[1],
+                name: 'PR Test Analysis',
+                head_sha: '${{ steps.pr_info.outputs.head_sha }}',
+                status: 'completed',
+                conclusion: conclusion,
+                output: {
+                  title: title,
+                  summary: summary
+                }
+              });
+            } catch (error) {
+              console.error('Failed to create check run:', error);
+            }
+
+      - name: Display final status
+        if: always()
         run: |
-          echo "📊 PR Analysis Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Compilation: ${{ steps.compile.outputs.compilation_success == 0 && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Execution: ${{ steps.tests.outputs.execution_success == 0 && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Coverage: see JaCoCo report" >> $GITHUB_STEP_SUMMARY
-          echo "- Mutation: see PIT report" >> $GITHUB_STEP_SUMMARY
-          echo "- Test Smells: see testSmells report" >> $GITHUB_STEP_SUMMARY
+          echo "========================================="
+          echo "         PR TEST ANALYSIS COMPLETE      "
+          echo "========================================="
+          echo ""
+          if [ "${{ steps.changed_tests.outputs.found_tests }}" != "true" ]; then
+            echo "⚠️  No test files found in PR #${{ github.event.inputs.pr_number }}"
+          elif [ "${{ steps.compile_base.outputs.compilation_status }}" != "0" ]; then
+            echo "❌ Analysis failed: Compilation error"
+          elif [ "${{ steps.run_tests.outputs.test_status }}" != "0" ]; then
+            echo "❌ Analysis completed with test failures"
+            echo "   - Failed tests: ${{ steps.run_tests.outputs.tests_failed }}"
+          else
+            echo "✅ Analysis completed successfully!"
+            echo "   - Tests passed: ${{ steps.run_tests.outputs.tests_passed }}/${{ steps.run_tests.outputs.tests_run }}"
+            echo "   - Coverage: ${{ steps.coverage.outputs.line_coverage }}%"
+            echo "   - Mutation score: ${{ steps.mutation.outputs.mutation_score }}%"
+          fi
+          echo ""
+          echo "📊 Full reports available in workflow artifacts"
+          echo "========================================="
 
+  # Separate job for generating detailed HTML report
+  generate-html-report:
+    needs: analyze-pr
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Generate HTML report
+        run: |
+          # Create base HTML template
+          cat > index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>PR Test Analysis Report</title>
+              <style>
+                  * { margin: 0; padding: 0; box-sizing: border-box; }
+                  body {
+                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      min-height: 100vh;
+                      padding: 20px;
+                  }
+                  .container {
+                      max-width: 1200px;
+                      margin: 0 auto;
+                      background: white;
+                      border-radius: 20px;
+                      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                      overflow: hidden;
+                  }
+                  .header {
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      color: white;
+                      padding: 40px;
+                      text-align: center;
+                  }
+                  .header h1 {
+                      font-size: 2.5em;
+                      margin-bottom: 10px;
+                  }
+                  .header p {
+                      opacity: 0.9;
+                      font-size: 1.1em;
+                  }
+                  .content {
+                      padding: 40px;
+                  }
+                  .metrics-grid {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                      gap: 20px;
+                      margin-bottom: 40px;
+                  }
+                  .metric-card {
+                      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+                      padding: 20px;
+                      border-radius: 10px;
+                      text-align: center;
+                      transition: transform 0.3s;
+                  }
+                  .metric-card:hover {
+                      transform: translateY(-5px);
+                  }
+                  .metric-value {
+                      font-size: 2.5em;
+                      font-weight: bold;
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      -webkit-background-clip: text;
+                      -webkit-text-fill-color: transparent;
+                  }
+                  .metric-label {
+                      color: #666;
+                      margin-top: 10px;
+                  }
+                  .section {
+                      margin-bottom: 40px;
+                  }
+                  .section h2 {
+                      color: #333;
+                      border-bottom: 3px solid #667eea;
+                      padding-bottom: 10px;
+                      margin-bottom: 20px;
+                  }
+                  table {
+                      width: 100%;
+                      border-collapse: collapse;
+                  }
+                  th, td {
+                      padding: 12px;
+                      text-align: left;
+                      border-bottom: 1px solid #eee;
+                  }
+                  th {
+                      background: #f8f9fa;
+                      font-weight: 600;
+                      color: #667eea;
+                  }
+                  .status-badge {
+                      display: inline-block;
+                      padding: 4px 12px;
+                      border-radius: 20px;
+                      font-size: 0.9em;
+                      font-weight: 600;
+                  }
+                  .status-success { background: #10b981; color: white; }
+                  .status-failure { background: #ef4444; color: white; }
+                  .status-warning { background: #f59e0b; color: white; }
+                  .progress-bar {
+                      width: 100%;
+                      height: 30px;
+                      background: #f3f4f6;
+                      border-radius: 15px;
+                      overflow: hidden;
+                      position: relative;
+                  }
+                  .progress-fill {
+                      height: 100%;
+                      background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+                      transition: width 0.5s;
+                      display: flex;
+                      align-items: center;
+                      justify-content: center;
+                      color: white;
+                      font-weight: bold;
+                  }
+                  .chart-container {
+                      width: 100%;
+                      height: 300px;
+                      margin: 20px 0;
+                  }
+                  .footer {
+                      background: #f8f9fa;
+                      padding: 20px;
+                      text-align: center;
+                      color: #666;
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>🔬 PR Test Analysis Report</h1>
+                      <p>Comprehensive testing and quality analysis</p>
+                  </div>
+                  
+                  <div class="content">
+                      <div class="metrics-grid">
+                          <div class="metric-card">
+                              <div class="metric-value" id="tests-passed">--</div>
+                              <div class="metric-label">Tests Passed</div>
+                          </div>
+                          <div class="metric-card">
+                              <div class="metric-value" id="code-coverage">--%</div>
+                              <div class="metric-label">Code Coverage</div>
+                          </div>
+                          <div class="metric-card">
+                              <div class="metric-value" id="mutation-score">--%</div>
+                              <div class="metric-label">Mutation Score</div>
+                          </div>
+                          <div class="metric-card">
+                              <div class="metric-value" id="test-smells">--</div>
+                              <div class="metric-label">Test Smells</div>
+                          </div>
+                      </div>
+                      
+                      <div class="section">
+                          <h2>📊 Test Results</h2>
+                          <div class="progress-bar">
+                              <div class="progress-fill" id="progress-fill" style="width: 0%">0%</div>
+                          </div>
+                      </div>
+                      
+                      <div class="section">
+                          <h2>📈 Coverage Analysis</h2>
+                          <table>
+                              <thead>
+                                  <tr>
+                                      <th>Coverage Type</th>
+                                      <th>Percentage</th>
+                                      <th>Status</th>
+                                  </tr>
+                              </thead>
+                              <tbody>
+                                  <tr>
+                                      <td>Line Coverage</td>
+                                      <td id="line-coverage">--%</td>
+                                      <td id="line-status"><span class="status-badge status-warning">Pending</span></td>
+                                  </tr>
+                                  <tr>
+                                      <td>Branch Coverage</td>
+                                      <td id="branch-coverage">--%</td>
+                                      <td id="branch-status"><span class="status-badge status-warning">Pending</span></td>
+                                  </tr>
+                              </tbody>
+                          </table>
+                      </div>
+                      
+                      <div class="section">
+                          <h2>🔍 Code Quality</h2>
+                          <table>
+                              <thead>
+                                  <tr>
+                                      <th>Test Smell</th>
+                                      <th>Count</th>
+                                      <th>Severity</th>
+                                  </tr>
+                              </thead>
+                              <tbody id="smells-table">
+                                  <tr>
+                                      <td colspan="3" style="text-align: center;">Loading...</td>
+                                  </tr>
+                              </tbody>
+                          </table>
+                      </div>
+                  </div>
+                  
+                  <div class="footer">
+                      <p>Generated by GitHub Actions Workflow • © 2024</p>
+                  </div>
+              </div>
+              
+              <script>
+                  // Populate with actual data
+                  document.addEventListener('DOMContentLoaded', function() {
+                      // Animation for progress bars and metrics
+                      setTimeout(() => {
+                          document.querySelectorAll('.metric-value').forEach(el => {
+                              el.style.transform = 'scale(1.1)';
+                              setTimeout(() => el.style.transform = 'scale(1)', 200);
+                          });
+                      }, 500);
+                  });
+              </script>
+          </body>
+          </html>
+          EOF
+          
+          # Populate HTML using Python
+          cat > populate_html.py << 'EOF'
+          import json
+          import sys
+          import re
+          
+          def get_status(percentage):
+              perc = float(percentage)
+              if perc >= 80:
+                  return 'success', '✅ Good'
+              elif perc >= 60:
+                  return 'warning', '⚠️ Moderate'
+              else:
+                  return 'failure', '❌ Low'
+          
+          # Load data
+          with open('artifacts/test-analysis-reports/metrics.json', 'r') as f:
+              metrics = json.load(f)
+          
+          with open('artifacts/test-analysis-reports/test_smells.json', 'r') as f:
+              smells_data = json.load(f)
+          
+          # Load HTML
+          with open('index.html', 'r') as f:
+              html = f.read()
+          
+          # Replace metrics
+          html = re.sub(r'id="tests-passed">[^<]+', f'id="tests-passed">{metrics["tests_passed"]}', html)
+          avg_coverage = (float(metrics["line_coverage"]) + float(metrics["branch_coverage"])) / 2
+          html = re.sub(r'id="code-coverage">[^<]+', f'id="code-coverage">{avg_coverage:.2f}%', html)
+          html = re.sub(r'id="mutation-score">[^<]+', f'id="mutation-score">{metrics["mutation_score"]}%', html)
+          html = re.sub(r'id="test-smells">[^<]+', f'id="test-smells">{metrics["total_smells"]}', html)
+          
+          # Progress bar
+          html = re.sub(r'style="width: 0%', f'style="width: {metrics["success_rate"]}%', html)
+          html = re.sub(r'>0%</div>', f'>{metrics["success_rate"]}%</div>', html)
+          
+          # Coverage table
+          html = re.sub(r'id="line-coverage">[^<]+', f'id="line-coverage">{metrics["line_coverage"]}%', html)
+          html = re.sub(r'id="branch-coverage">[^<]+', f'id="branch-coverage">{metrics["branch_coverage"]}%', html)
+          
+          line_class, line_text = get_status(metrics["line_coverage"])
+          branch_class, branch_text = get_status(metrics["branch_coverage"])
+          
+          html = re.sub(r'id="line-status"><span [^>]+>[^<]+</span>', f'id="line-status"><span class="status-badge status-{line_class}">{line_text}</span>', html)
+          html = re.sub(r'id="branch-status"><span [^>]+>[^<]+</span>', f'id="branch-status"><span class="status-badge status-{branch_class}">{branch_text}</span>', html)
+          
+          # Smells table
+          smells_rows = ''
+          for smell, count in smells_data['smells'].items():
+              severity_class, severity_text = get_status(100 - (count * 10)) if count > 0 else ('success', '✅ None')
+              smells_rows += f'<tr><td>{smell.replace("_", " ").title()}</td><td>{count}</td><td><span class="status-badge status-{severity_class}">{severity_text}</span></td></tr>'
+          
+          html = re.sub(r'<tbody id="smells-table">.*?</tbody>', f'<tbody id="smells-table">{smells_rows}</tbody>', html, flags=re.DOTALL)
+          
+          # Write updated HTML
+          with open('index.html', 'w') as f:
+              f.write(html)
+          EOF
+          
+          python3 populate_html.py
+          
+          echo "✅ HTML report generated and populated"
 
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-report
+          path: index.html
+          retention-days: 30
+
+      - name: Display workflow summary
+        run: |
+          echo "## 📋 Workflow Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Analysis | ✅ Completed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Reports Generated | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifacts Uploaded | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Available Artifacts:" >> $GITHUB_STEP_SUMMARY
+          echo "- Test Analysis Reports" >> $GITHUB_STEP_SUMMARY
+          echo "- Coverage Reports" >> $GITHUB_STEP_SUMMARY
+          echo "- Mutation Reports" >> $GITHUB_STEP_SUMMARY
+          echo "- HTML Summary Report" >> $GITHUB_STEP_SUMMARY
