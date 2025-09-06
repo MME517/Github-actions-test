@@ -16,10 +16,15 @@ env:
   JAVA_VERSION: '17'
   GRADLE_VERSION: '8.5'
   MAVEN_VERSION: '3.9.6'
+  KOTLIN_VERSION: '1.9.0'
+  PYTHON_VERSION: '3.10'
 
 jobs:
   analyze-pr:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: read
       pull-requests: read
@@ -34,11 +39,20 @@ jobs:
             echo "❌ Invalid repository format. Expected: owner/repo"
             exit 1
           fi
+          if [[ "${{ github.event.inputs.repo_name }}" =~ \.\. ]]; then
+            echo "❌ Invalid repository name: path traversal detected"
+            exit 1
+          fi
           if [[ ! "${{ github.event.inputs.pr_number }}" =~ ^[0-9]+$ ]]; then
             echo "❌ Invalid PR number. Expected: numeric value"
             exit 1
           fi
           echo "✅ Inputs validated successfully"
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -48,16 +62,40 @@ jobs:
           cache: 'gradle'
 
       - name: Setup Kotlin
-        run: |
-          curl -s https://get.sdkman.io | bash
-          source "$HOME/.sdkman/bin/sdkman-init.sh"
-          sdk install kotlin
+        uses: fwilhe2/setup-kotlin@v1
+        with:
+          version: ${{ env.KOTLIN_VERSION }}
 
-      - name: Checkout target repository
+      - name: Cache dependencies
+        id: cache-deps
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.m2/repository
+          key: ${{ runner.os }}-${{ hashFiles('**/build.gradle', '**/build.gradle.kts', '**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+            ${{ runner.os }}-maven-
+
+      - name: Checkout base repository
+        id: checkout-base
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo_name }}
+          ref: ${{ steps.pr_info.outputs.base_branch || 'main' }}
+          path: base-repo
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout PR repository
+        id: checkout-pr
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.repo_name }}
           ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
+          path: pr-repo
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -77,10 +115,10 @@ jobs:
       - name: Detect build system
         id: detect_build
         run: |
-          if [ -f "pom.xml" ]; then
+          if [ -f "pr-repo/pom.xml" ]; then
             echo "build_system=maven" >> $GITHUB_OUTPUT
             echo "📦 Detected Maven project"
-          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+          elif [ -f "pr-repo/build.gradle" ] || [ -f "pr-repo/build.gradle.kts" ]; then
             echo "build_system=gradle" >> $GITHUB_OUTPUT
             echo "📦 Detected Gradle project"
           else
@@ -105,37 +143,32 @@ jobs:
         id: changed_tests
         run: |
           echo "🔍 Identifying changed test files in PR..."
+          cd pr-repo
           git diff --name-only ${{ steps.pr_info.outputs.base_sha }}..${{ steps.pr_info.outputs.head_sha }} | \
-            grep -E '\.(java|kt)$' | \
-            grep -E '(test|spec)' > changed_tests.txt || true
+            grep -E '(Test|Spec)\.(java|kt)$|/(test|spec)/.*\.(java|kt)$' > ../changed_tests.txt || echo "No test files found" > ../changed_tests.txt
           
-          if [ -s changed_tests.txt ]; then
+          if [ -s ../changed_tests.txt ] && grep -q "[^[:space:]]" ../changed_tests.txt; then
             echo "found_tests=true" >> $GITHUB_OUTPUT
             echo "📋 Changed test files:"
-            cat changed_tests.txt
+            cat ../changed_tests.txt
           else
             echo "found_tests=false" >> $GITHUB_OUTPUT
             echo "⚠️ No test files found in PR"
           fi
-
-      - name: Checkout base branch
-        if: steps.changed_tests.outputs.found_tests == 'true'
-        run: |
-          git checkout ${{ steps.pr_info.outputs.base_branch }}
-          echo "✅ Checked out base branch: ${{ steps.pr_info.outputs.base_branch }}"
 
       - name: Compile base code
         id: compile_base
         if: steps.changed_tests.outputs.found_tests == 'true'
         run: |
           echo "🔨 Compiling base code..."
+          cd base-repo
           START_TIME=$(date +%s)
           
           if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
-            ./gradlew clean compileJava compileKotlin compileTestJava compileTestKotlin 2>&1 | tee compile_base.log
+            ./gradlew clean compileJava compileKotlin compileTestJava compileTestKotlin 2>&1 | tee ../compile_base.log
             COMPILE_STATUS=${PIPESTATUS[0]}
           else
-            mvn clean compile test-compile 2>&1 | tee compile_base.log
+            mvn clean compile test-compile 2>&1 | tee ../compile_base.log
             COMPILE_STATUS=${PIPESTATUS[0]}
           fi
           
@@ -155,43 +188,54 @@ jobs:
         if: steps.changed_tests.outputs.found_tests == 'true' && steps.compile_base.outputs.compilation_status == '0'
         run: |
           echo "📋 Copying PR test files to base code..."
-          git checkout ${{ steps.pr_info.outputs.head_sha }} -- $(cat changed_tests.txt)
+          while IFS= read -r test_file; do
+            if [ -n "$test_file" ]; then
+              echo "Copying $test_file"
+              mkdir -p "base-repo/$(dirname "$test_file")"
+              cp "pr-repo/$test_file" "base-repo/$test_file"
+            fi
+          done < changed_tests.txt
           echo "✅ Test files copied successfully"
 
       - name: Run tests with coverage
         id: run_tests
         if: steps.changed_tests.outputs.found_tests == 'true' && steps.compile_base.outputs.compilation_status == '0'
+        timeout-minutes: 30
         run: |
           echo "🧪 Running tests with coverage..."
+          cd base-repo
           START_TIME=$(date +%s)
           
           mkdir -p test-results
           
+          # Extract test class names from file paths
+          TEST_CLASSES=""
+          while IFS= read -r test_file; do
+            if [ -n "$test_file" ]; then
+              # Convert file path to class name
+              CLASS_NAME=$(echo "$test_file" | sed 's/src\/[^\/]*\/java\///' | sed 's/src\/[^\/]*\/kotlin\///' | sed 's/\.java$//' | sed 's/\.kt$//' | tr '/' '.')
+              TEST_CLASSES="${TEST_CLASSES},${CLASS_NAME}"
+            fi
+          done < ../changed_tests.txt
+          
+          # Remove leading comma
+          TEST_CLASSES=$(echo "$TEST_CLASSES" | sed 's/^,//')
+          
           if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
-            # Create custom gradle task for specific tests
-            cat >> build.gradle << 'EOF'
-          task runSpecificTests(type: Test) {
-              def testFiles = file('changed_tests.txt').readLines()
-              testFiles.each { file ->
-                  def className = file.replaceAll('/', '.').replaceAll('\\.java$|\\.kt$', '')
-                  include "**/${className.split('\\.')[-1]}.*"
-              }
-              testLogging {
-                  events "passed", "skipped", "failed"
-                  exceptionFormat "full"
-              }
-              reports {
-                  junitXml.enabled = true
-                  html.enabled = true
-              }
-          }
-          EOF
-            ./gradlew runSpecificTests jacocoTestReport 2>&1 | tee test_execution.log
+            # Use Gradle's built-in test filtering
+            if [ -n "$TEST_CLASSES" ]; then
+              ./gradlew test --tests "*${TEST_CLASSES//,/* --tests *}" jacocoTestReport 2>&1 | tee ../test_execution.log
+            else
+              ./gradlew test jacocoTestReport 2>&1 | tee ../test_execution.log
+            fi
             TEST_STATUS=${PIPESTATUS[0]}
           else
             # Maven with specific test classes
-            TEST_CLASSES=$(cat changed_tests.txt | sed 's/.*\///g' | sed 's/\..*//' | tr '\n' ',')
-            mvn test -Dtest="$TEST_CLASSES" jacoco:report 2>&1 | tee test_execution.log
+            if [ -n "$TEST_CLASSES" ]; then
+              mvn test -Dtest="$TEST_CLASSES" jacoco:report 2>&1 | tee ../test_execution.log
+            else
+              mvn test jacoco:report 2>&1 | tee ../test_execution.log
+            fi
             TEST_STATUS=${PIPESTATUS[0]}
           fi
           
@@ -203,15 +247,15 @@ jobs:
           
           # Extract test results
           if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
-            TESTS_RUN=$(grep -oP 'tests?: \K\d+' test_execution.log | tail -1 || echo "0")
-            TESTS_PASSED=$(grep -oP 'passed?: \K\d+' test_execution.log | tail -1 || echo "0")
-            TESTS_FAILED=$(grep -oP 'failed?: \K\d+' test_execution.log | tail -1 || echo "0")
-            TESTS_SKIPPED=$(grep -oP 'skipped?: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_RUN=$(grep -oP 'tests?: \K\d+' ../test_execution.log | tail -1 || echo "0")
+            TESTS_PASSED=$(grep -oP 'passed?: \K\d+' ../test_execution.log | tail -1 || echo "0")
+            TESTS_FAILED=$(grep -oP 'failed?: \K\d+' ../test_execution.log | tail -1 || echo "0")
+            TESTS_SKIPPED=$(grep -oP 'skipped?: \K\d+' ../test_execution.log | tail -1 || echo "0")
           else
-            TESTS_RUN=$(grep -oP 'Tests run: \K\d+' test_execution.log | tail -1 || echo "0")
-            TESTS_FAILED=$(grep -oP 'Failures: \K\d+' test_execution.log | tail -1 || echo "0")
-            TESTS_ERRORS=$(grep -oP 'Errors: \K\d+' test_execution.log | tail -1 || echo "0")
-            TESTS_SKIPPED=$(grep -oP 'Skipped: \K\d+' test_execution.log | tail -1 || echo "0")
+            TESTS_RUN=$(grep -oP 'Tests run: \K\d+' ../test_execution.log | tail -1 || echo "0")
+            TESTS_FAILED=$(grep -oP 'Failures: \K\d+' ../test_execution.log | tail -1 || echo "0")
+            TESTS_ERRORS=$(grep -oP 'Errors: \K\d+' ../test_execution.log | tail -1 || echo "0")
+            TESTS_SKIPPED=$(grep -oP 'Skipped: \K\d+' ../test_execution.log | tail -1 || echo "0")
             TESTS_PASSED=$((TESTS_RUN - TESTS_FAILED - TESTS_ERRORS - TESTS_SKIPPED))
           fi
           
@@ -225,6 +269,7 @@ jobs:
         if: steps.changed_tests.outputs.found_tests == 'true' && steps.run_tests.outputs.test_status == '0'
         run: |
           echo "📊 Parsing coverage results..."
+          cd base-repo
           
           if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
             COVERAGE_FILE="build/reports/jacoco/test/jacocoTestReport.xml"
@@ -236,29 +281,37 @@ jobs:
             # Parse JaCoCo XML for coverage metrics
             LINE_COVERAGE=$(python3 -c "
           import xml.etree.ElementTree as ET
-          tree = ET.parse('$COVERAGE_FILE')
-          root = tree.getroot()
-          for counter in root.findall('.//counter[@type=\"LINE\"]'):
-              missed = int(counter.get('missed', 0))
-              covered = int(counter.get('covered', 0))
-              if (missed + covered) > 0:
-                  print(f'{(covered / (missed + covered)) * 100:.2f}')
-                  break
-          else:
+          try:
+              tree = ET.parse('$COVERAGE_FILE')
+              root = tree.getroot()
+              for counter in root.findall('.//counter[@type=\"LINE\"]'):
+                  missed = int(counter.get('missed', 0))
+                  covered = int(counter.get('covered', 0))
+                  if (missed + covered) > 0:
+                      print(f'{(covered / (missed + covered)) * 100:.2f}')
+                      break
+              else:
+                  print('0.00')
+          except Exception as e:
+              print(f'Error parsing coverage: {e}')
               print('0.00')
           ")
             
             BRANCH_COVERAGE=$(python3 -c "
           import xml.etree.ElementTree as ET
-          tree = ET.parse('$COVERAGE_FILE')
-          root = tree.getroot()
-          for counter in root.findall('.//counter[@type=\"BRANCH\"]'):
-              missed = int(counter.get('missed', 0))
-              covered = int(counter.get('covered', 0))
-              if (missed + covered) > 0:
-                  print(f'{(covered / (missed + covered)) * 100:.2f}')
-                  break
-          else:
+          try:
+              tree = ET.parse('$COVERAGE_FILE')
+              root = tree.getroot()
+              for counter in root.findall('.//counter[@type=\"BRANCH\"]'):
+                  missed = int(counter.get('missed', 0))
+                  covered = int(counter.get('covered', 0))
+                  if (missed + covered) > 0:
+                      print(f'{(covered / (missed + covered)) * 100:.2f}')
+                      break
+              else:
+                  print('0.00')
+          except Exception as e:
+              print(f'Error parsing coverage: {e}')
               print('0.00')
           ")
             
@@ -274,34 +327,24 @@ jobs:
       - name: Run mutation testing
         id: mutation
         if: steps.changed_tests.outputs.found_tests == 'true' && steps.run_tests.outputs.test_status == '0'
+        timeout-minutes: 45
         continue-on-error: true
         run: |
           echo "🧬 Running mutation testing with PIT..."
+          cd base-repo
           
           if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
-            # Add PIT plugin to gradle
-            cat >> build.gradle << 'EOF'
-          plugins {
-              id 'info.solidsoft.pitest' version '1.15.0'
-          }
-          pitest {
-              targetClasses = ['com.*', 'org.*']
-              pitestVersion = '1.15.2'
-              threads = 4
-              outputFormats = ['XML', 'HTML']
-              timestampedReports = false
-          }
-          EOF
-            ./gradlew pitest 2>&1 | tee mutation.log
+            # Use command-line PIT for Gradle without modifying build files
+            ./gradlew pitest -Dpitest.mutationEngine=gregor -Dpitest.targetClasses="com.*,org.*" 2>&1 | tee ../mutation.log
             MUTATION_REPORT="build/reports/pitest/index.html"
           else
-            # Add PIT plugin to maven
-            mvn org.pitest:pitest-maven:mutationCoverage 2>&1 | tee mutation.log
+            # Use Maven plugin
+            mvn org.pitest:pitest-maven:mutationCoverage -DtargetClasses="com.*,org.*" 2>&1 | tee ../mutation.log
             MUTATION_REPORT="target/pit-reports/index.html"
           fi
           
           # Extract mutation score
-          MUTATION_SCORE=$(grep -oP 'mutations? killed.+?(\d+)%' mutation.log | grep -oP '\d+' | tail -1 || echo "0")
+          MUTATION_SCORE=$(grep -oP 'mutations? killed.+?(\d+)%' ../mutation.log | grep -oP '\d+' | tail -1 || echo "0")
           echo "mutation_score=$MUTATION_SCORE" >> $GITHUB_OUTPUT
           echo "✅ Mutation testing score: $MUTATION_SCORE%"
 
@@ -311,11 +354,12 @@ jobs:
         run: |
           echo "🔍 Detecting test smells..."
           
-          # Create test smell detection script
+          # Create improved test smell detection script
           cat > detect_smells.py << 'EOF'
           import re
           import sys
           import json
+          import os
           
           smells = {
               "assertion_roulette": 0,
@@ -333,68 +377,71 @@ jobs:
           smell_details = []
           
           def analyze_file(filepath):
-              with open(filepath, 'r') as f:
-                  content = f.read()
-                  lines = content.split('\n')
-                  
-                  # Count assertions per test method
-                  test_methods = re.findall(r'@Test.*?\n.*?void\s+(\w+)', content, re.DOTALL)
-                  for method in test_methods:
-                      method_content = re.search(rf'void\s+{method}.*?{{(.*?)}}', content, re.DOTALL)
-                      if method_content:
-                          assertions = len(re.findall(r'assert\w+', method_content.group(1)))
-                          if assertions > 5:
-                              smells["assertion_roulette"] += 1
-                              smell_details.append(f"Assertion Roulette in {filepath}::{method}")
-                          if assertions == 0:
-                              smells["lazy_test"] += 1
-                              smell_details.append(f"Lazy Test in {filepath}::{method}")
-                  
-                  # Check for external dependencies
-                  if re.search(r'(new File|FileReader|FileWriter|Database|Connection)', content):
-                      smells["mystery_guest"] += 1
-                      smell_details.append(f"Mystery Guest in {filepath}")
-                  
-                  # Check for string equality
-                  if re.search(r'assertEquals.*?".*?"', content):
-                      smells["sensitive_equality"] += 1
-                      smell_details.append(f"Sensitive Equality in {filepath}")
-                  
-                  # Check for private field access
-                  if re.search(r'@(InjectMocks|Spy|Mock).*?private', content):
-                      smells["inappropriate_intimacy"] += 1
-                      smell_details.append(f"Inappropriate Intimacy in {filepath}")
-                  
-                  # Check for resource handling
-                  if re.search(r'(close\(\)|finally)', content):
-                      if not re.search(r'try.*?finally', content, re.DOTALL):
-                          smells["resource_optimism"] += 1
-                          smell_details.append(f"Resource Optimism in {filepath}")
-                  
-                  # Check for magic numbers
-                  magic_numbers = re.findall(r'(?<![\w.])[0-9]+(?![\w.])', content)
-                  if len([n for n in magic_numbers if n not in ['0', '1', '2']]) > 5:
-                      smells["magic_numbers"] += 1
-                      smell_details.append(f"Magic Numbers in {filepath}")
-                  
-                  # Check for conditional logic
-                  if re.search(r'@Test.*?if\s*\(', content, re.DOTALL):
-                      smells["conditional_test"] += 1
-                      smell_details.append(f"Conditional Test Logic in {filepath}")
-                  
-                  # Check for exception handling
-                  if re.search(r'catch\s*\(.*?\)\s*{\s*}', content):
-                      smells["exception_handling"] += 1
-                      smell_details.append(f"Empty Exception Handling in {filepath}")
+              try:
+                  with open(filepath, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                      lines = content.split('\n')
+                      
+                      # Count assertions per test method
+                      test_methods = re.findall(r'@Test.*?\n.*?void\s+(\w+)', content, re.DOTALL)
+                      for method in test_methods:
+                          method_content = re.search(rf'void\s+{method}.*?{{(.*?)}}', content, re.DOTALL)
+                          if method_content:
+                              assertions = len(re.findall(r'assert\w+', method_content.group(1)))
+                              if assertions > 5:
+                                  smells["assertion_roulette"] += 1
+                                  smell_details.append(f"Assertion Roulette in {filepath}::{method}")
+                              if assertions == 0:
+                                  smells["lazy_test"] += 1
+                                  smell_details.append(f"Lazy Test in {filepath}::{method}")
+                      
+                      # Check for external dependencies
+                      if re.search(r'(new File|FileReader|FileWriter|Database|Connection)', content):
+                          smells["mystery_guest"] += 1
+                          smell_details.append(f"Mystery Guest in {filepath}")
+                      
+                      # Check for string equality
+                      if re.search(r'assertEquals.*?".*?"', content):
+                          smells["sensitive_equality"] += 1
+                          smell_details.append(f"Sensitive Equality in {filepath}")
+                      
+                      # Check for private field access
+                      if re.search(r'@(InjectMocks|Spy|Mock).*?private', content):
+                          smells["inappropriate_intimacy"] += 1
+                          smell_details.append(f"Inappropriate Intimacy in {filepath}")
+                      
+                      # Check for resource handling
+                      if re.search(r'(close\(\)|finally)', content):
+                          if not re.search(r'try.*?finally', content, re.DOTALL):
+                              smells["resource_optimism"] += 1
+                              smell_details.append(f"Resource Optimism in {filepath}")
+                      
+                      # Check for magic numbers (excluding 0, 1, -1, 2)
+                      magic_numbers = re.findall(r'(?<![\w.])[0-9]+(?![\w.])', content)
+                      if len([n for n in magic_numbers if n not in ['0', '1', '2', '-1']]) > 5:
+                          smells["magic_numbers"] += 1
+                          smell_details.append(f"Magic Numbers in {filepath}")
+                      
+                      # Check for conditional logic
+                      if re.search(r'@Test.*?if\s*\(', content, re.DOTALL):
+                          smells["conditional_test"] += 1
+                          smell_details.append(f"Conditional Test Logic in {filepath}")
+                      
+                      # Check for exception handling
+                      if re.search(r'catch\s*\(.*?\)\s*{\s*}', content):
+                          smells["exception_handling"] += 1
+                          smell_details.append(f"Empty Exception Handling in {filepath}")
+              except Exception as e:
+                  print(f"Error analyzing {filepath}: {e}")
           
           with open('changed_tests.txt', 'r') as f:
               for line in f:
                   filepath = line.strip()
                   if filepath:
                       try:
-                          analyze_file(filepath)
+                          analyze_file(f"pr-repo/{filepath}")
                       except Exception as e:
-                          print(f"Error analyzing {filepath}: {e}")
+                          print(f"Error processing {filepath}: {e}")
           
           total_smells = sum(smells.values())
           print(f"Total smells detected: {total_smells}")
@@ -409,7 +456,7 @@ jobs:
           EOF
           
           python3 detect_smells.py
-          TOTAL_SMELLS=$(python3 -c "import json; print(json.load(open('test_smells.json'))['total'])")
+          TOTAL_SMELLS=$(python3 -c "import json; data=json.load(open('test_smells.json')); print(data.get('total', 0))" 2>/dev/null || echo "0")
           echo "total_smells=$TOTAL_SMELLS" >> $GITHUB_OUTPUT
           echo "✅ Test smells detected: $TOTAL_SMELLS"
 
@@ -435,9 +482,9 @@ jobs:
                   
                   # Add test results if available
                   if [ "${{ steps.detect_build.outputs.build_system }}" == "gradle" ]; then
-                      TEST_RESULT_FILE="build/test-results/test/TEST-*${TEST_NAME}*.xml"
+                      TEST_RESULT_FILE="base-repo/build/test-results/test/TEST-*${TEST_NAME}*.xml"
                   else
-                      TEST_RESULT_FILE="target/surefire-reports/TEST-*${TEST_NAME}*.xml"
+                      TEST_RESULT_FILE="base-repo/target/surefire-reports/TEST-*${TEST_NAME}*.xml"
                   fi
                   
                   if ls $TEST_RESULT_FILE 1> /dev/null 2>&1; then
@@ -447,30 +494,33 @@ jobs:
           import glob
           
           for file in glob.glob('$TEST_RESULT_FILE'):
-              tree = ET.parse(file)
-              root = tree.getroot()
-              testcase_elements = root.findall('.//testcase')
-              
-              print('| Test Method | Status | Time (s) |')
-              print('|-------------|--------|----------|')
-              
-              for tc in testcase_elements:
-                  name = tc.get('name', 'Unknown')
-                  time = tc.get('time', '0')
-                  failure = tc.find('failure')
-                  error = tc.find('error')
-                  skipped = tc.find('skipped')
+              try:
+                  tree = ET.parse(file)
+                  root = tree.getroot()
+                  testcase_elements = root.findall('.//testcase')
                   
-                  if failure is not None:
-                      status = '❌ Failed'
-                  elif error is not None:
-                      status = '❌ Error'
-                  elif skipped is not None:
-                      status = '⏭️ Skipped'
-                  else:
-                      status = '✅ Passed'
+                  print('| Test Method | Status | Time (s) |')
+                  print('|-------------|--------|----------|')
                   
-                  print(f'| {name} | {status} | {time} |')
+                  for tc in testcase_elements:
+                      name = tc.get('name', 'Unknown')
+                      time = tc.get('time', '0')
+                      failure = tc.find('failure')
+                      error = tc.find('error')
+                      skipped = tc.find('skipped')
+                      
+                      if failure is not None:
+                          status = '❌ Failed'
+                      elif error is not None:
+                          status = '❌ Error'
+                      elif skipped is not None:
+                          status = '⏭️ Skipped'
+                      else:
+                          status = '✅ Passed'
+                      
+                      print(f'| {name} | {status} | {time} |')
+              except Exception as e:
+                  print(f'Error parsing test results: {e}')
           " >> "$REPORT_FILE"
                       echo "" >> "$REPORT_FILE"
                   fi
@@ -480,15 +530,18 @@ jobs:
                   python3 -c "
           import json
           
-          with open('test_smells.json', 'r') as f:
-              data = json.load(f)
-              details = [d for d in data['details'] if '$test_file' in d]
-              if details:
-                  print('### Test Smells Detected:')
-                  for detail in details:
-                      print(f'- {detail}')
-              else:
-                  print('✅ No test smells detected in this file')
+          try:
+              with open('test_smells.json', 'r') as f:
+                  data = json.load(f)
+                  details = [d for d in data.get('details', []) if '$test_file' in d]
+                  if details:
+                      print('### Test Smells Detected:')
+                      for detail in details:
+                          print(f'- {detail}')
+                  else:
+                      print('✅ No test smells detected in this file')
+          except Exception as e:
+              print(f'Error loading smell data: {e}')
           " >> "$REPORT_FILE"
                   
                   echo "✅ Generated report for $TEST_NAME"
@@ -553,11 +606,14 @@ jobs:
           if [ -f "test_smells.json" ]; then
             python3 -c "
           import json
-          with open('test_smells.json', 'r') as f:
-              data = json.load(f)
-              for smell, count in data['smells'].items():
-                  icon = '⚠️' if count > 0 else '✅'
-                  print(f'| {smell.replace(\"_\", \" \").title()} | {count} {icon} |')
+          try:
+              with open('test_smells.json', 'r') as f:
+                  data = json.load(f)
+                  for smell, count in data.get('smells', {}).items():
+                      icon = '⚠️' if count > 0 else '✅'
+                      print(f'| {smell.replace(\"_\", \" \").title()} | {count} {icon} |')
+          except Exception as e:
+              print('| Error loading smell data | - |')
           "
           else
             echo "| No analysis available | - |"
@@ -594,24 +650,28 @@ jobs:
           
           # Calculate overall quality score
           python3 -c "
-          compilation = 1 if '${{ steps.compile_base.outputs.compilation_status }}' == '0' else 0
-          test_success = float('${{ steps.run_tests.outputs.tests_passed }}') / max(float('${{ steps.run_tests.outputs.tests_run }}'), 1) if '${{ steps.run_tests.outputs.tests_run }}' != '0' else 0
-          coverage = (float('${{ steps.coverage.outputs.line_coverage }}') + float('${{ steps.coverage.outputs.branch_coverage }}')) / 200
-          mutation = float('${{ steps.mutation.outputs.mutation_score }}') / 100
-          smells = max(0, 1 - (float('${{ steps.test_smells.outputs.total_smells }}') / 10))
-          
-          score = (compilation * 20 + test_success * 25 + coverage * 25 + mutation * 20 + smells * 10)
-          
-          grade = 'A' if score >= 90 else 'B' if score >= 80 else 'C' if score >= 70 else 'D' if score >= 60 else 'F'
-          
-          print(f'**Overall Quality Score:** {score:.1f}/100 (Grade: {grade})')
-          print('')
-          print('### Score Breakdown:')
-          print(f'- Compilation: {compilation * 20:.1f}/20')
-          print(f'- Test Success: {test_success * 25:.1f}/25')
-          print(f'- Code Coverage: {coverage * 25:.1f}/25')
-          print(f'- Mutation Testing: {mutation * 20:.1f}/20')
-          print(f'- Code Quality: {smells * 10:.1f}/10')
+          try:
+              compilation = 1 if '${{ steps.compile_base.outputs.compilation_status }}' == '0' else 0
+              test_success = float('${{ steps.run_tests.outputs.tests_passed }}') / max(float('${{ steps.run_tests.outputs.tests_run }}'), 1) if '${{ steps.run_tests.outputs.tests_run }}' != '0' else 0
+              coverage = (float('${{ steps.coverage.outputs.line_coverage }}') + float('${{ steps.coverage.outputs.branch_coverage }}')) / 200
+              mutation = float('${{ steps.mutation.outputs.mutation_score }}') / 100
+              smells = max(0, 1 - (float('${{ steps.test_smells.outputs.total_smells }}') / 10))
+              
+              score = (compilation * 20 + test_success * 25 + coverage * 25 + mutation * 20 + smells * 10)
+              
+              grade = 'A' if score >= 90 else 'B' if score >= 80 else 'C' if score >= 70 else 'D' if score >= 60 else 'F'
+              
+              print(f'**Overall Quality Score:** {score:.1f}/100 (Grade: {grade})')
+              print('')
+              print('### Score Breakdown:')
+              print(f'- Compilation: {compilation * 20:.1f}/20')
+              print(f'- Test Success: {test_success * 25:.1f}/25')
+              print(f'- Code Coverage: {coverage * 25:.1f}/25')
+              print(f'- Mutation Testing: {mutation * 20:.1f}/20')
+              print(f'- Code Quality: {smells * 10:.1f}/10')
+          except Exception as e:
+              print('Error calculating quality score')
+              print(f'**Overall Quality Score:** N/A')
           " >> summary_report.md
           
           echo "" >> summary_report.md
@@ -640,9 +700,9 @@ jobs:
         with:
           name: coverage-reports
           path: |
-            **/jacoco/**
-            **/site/jacoco/**
-            **/reports/jacoco/**
+            base-repo/**/jacoco/**
+            base-repo/**/site/jacoco/**
+            base-repo/**/reports/jacoco/**
           retention-days: 30
 
       - name: Upload mutation reports
@@ -651,8 +711,8 @@ jobs:
         with:
           name: mutation-reports
           path: |
-            **/pit-reports/**
-            **/reports/pitest/**
+            base-repo/**/pit-reports/**
+            base-repo/**/reports/pitest/**
           retention-days: 30
 
       - name: Post summary as PR comment
@@ -662,9 +722,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const summaryContent = fs.readFileSync('summary_report.md', 'utf8');
-            
             try {
+              const summaryContent = fs.readFileSync('summary_report.md', 'utf8');
               await github.rest.issues.createComment({
                 owner: '${{ github.event.inputs.repo_name }}'.split('/')[0],
                 repo: '${{ github.event.inputs.repo_name }}'.split('/')[1],
@@ -713,6 +772,14 @@ jobs:
               console.error('Failed to create check run:', error);
             }
 
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "🧹 Cleaning up temporary files..."
+          rm -f changed_tests.txt compile_base.log test_execution.log mutation.log
+          rm -f test_smells.json detect_smells.py
+          echo "✅ Cleanup completed"
+
       - name: Display final status
         if: always()
         run: |
@@ -751,7 +818,22 @@ jobs:
       
       - name: Generate HTML report
         run: |
-          cat > index.html << 'EOF'
+          # Extract data from summary report
+          LINE_COVERAGE=$(grep -oP 'Line Coverage.*\|\s*\K[0-9.]+' artifacts/summary_report.md 2>/dev/null || echo "0")
+          BRANCH_COVERAGE=$(grep -oP 'Branch Coverage.*\|\s*\K[0-9.]+' artifacts/summary_report.md 2>/dev/null || echo "0")
+          TESTS_PASSED=$(grep -oP 'Tests Passed.*\|\s*\K[0-9]+' artifacts/summary_report.md 2>/dev/null || echo "0")
+          TESTS_RUN=$(grep -oP 'Total Tests Run.*\|\s*\K[0-9]+' artifacts/summary_report.md 2>/dev/null || echo "0")
+          MUTATION_SCORE=$(grep -oP 'Mutation Score.*\|\s*\K[0-9.]+' artifacts/summary_report.md 2>/dev/null || echo "0")
+          TOTAL_SMELLS=$(grep -oP 'Total Smells.*\|\s*\*\*[0-9]+\*\*' artifacts/summary_report.md | grep -oP '[0-9]+' 2>/dev/null || echo "0")
+          
+          # Calculate success percentage
+          if [ "$TESTS_RUN" -gt 0 ]; then
+            SUCCESS_PERCENTAGE=$((TESTS_PASSED * 100 / TESTS_RUN))
+          else
+            SUCCESS_PERCENTAGE=0
+          fi
+          
+          cat > index.html << EOF
           <!DOCTYPE html>
           <html lang="en">
           <head>
@@ -892,19 +974,19 @@ jobs:
                   <div class="content">
                       <div class="metrics-grid">
                           <div class="metric-card">
-                              <div class="metric-value">--</div>
+                              <div class="metric-value">$TESTS_PASSED/$TESTS_RUN</div>
                               <div class="metric-label">Tests Passed</div>
                           </div>
                           <div class="metric-card">
-                              <div class="metric-value">--%</div>
+                              <div class="metric-value">${LINE_COVERAGE}%</div>
                               <div class="metric-label">Code Coverage</div>
                           </div>
                           <div class="metric-card">
-                              <div class="metric-value">--%</div>
+                              <div class="metric-value">${MUTATION_SCORE}%</div>
                               <div class="metric-label">Mutation Score</div>
                           </div>
                           <div class="metric-card">
-                              <div class="metric-value">--</div>
+                              <div class="metric-value">$TOTAL_SMELLS</div>
                               <div class="metric-label">Test Smells</div>
                           </div>
                       </div>
@@ -912,7 +994,7 @@ jobs:
                       <div class="section">
                           <h2>📊 Test Results</h2>
                           <div class="progress-bar">
-                              <div class="progress-fill" style="width: 0%">0%</div>
+                              <div class="progress-fill" style="width: ${SUCCESS_PERCENTAGE}%">${SUCCESS_PERCENTAGE}%</div>
                           </div>
                       </div>
                       
@@ -929,13 +1011,13 @@ jobs:
                               <tbody>
                                   <tr>
                                       <td>Line Coverage</td>
-                                      <td>--%</td>
-                                      <td><span class="status-badge status-warning">Pending</span></td>
+                                      <td>${LINE_COVERAGE}%</td>
+                                      <td><span class="status-badge $([[ $(echo "$LINE_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "status-success" || ([[ $(echo "$LINE_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "status-warning" || echo "status-failure")) ">$([[ $(echo "$LINE_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "Good" || ([[ $(echo "$LINE_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "Fair" || echo "Poor"))</span></td>
                                   </tr>
                                   <tr>
                                       <td>Branch Coverage</td>
-                                      <td>--%</td>
-                                      <td><span class="status-badge status-warning">Pending</span></td>
+                                      <td>${BRANCH_COVERAGE}%</td>
+                                      <td><span class="status-badge $([[ $(echo "$BRANCH_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "status-success" || ([[ $(echo "$BRANCH_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "status-warning" || echo "status-failure")) ">$([[ $(echo "$BRANCH_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "Good" || ([[ $(echo "$BRANCH_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "Fair" || echo "Poor"))</span></td>
                                   </tr>
                               </tbody>
                           </table>
@@ -951,9 +1033,10 @@ jobs:
                                       <th>Severity</th>
                                   </tr>
                               </thead>
-                              <tbody id="smells-table">
+                              <tbody>
+                                  <!-- Smells data would be populated here -->
                                   <tr>
-                                      <td colspan="3" style="text-align: center;">Loading...</td>
+                                      <td colspan="3" style="text-align: center;">Detailed smell analysis available in the test reports</td>
                                   </tr>
                               </tbody>
                           </table>
@@ -966,15 +1049,16 @@ jobs:
               </div>
               
               <script>
-                  // Populate with actual data from artifacts
+                  // Animation for metrics
                   document.addEventListener('DOMContentLoaded', function() {
-                      // Animation for progress bars and metrics
-                      setTimeout(() => {
-                          document.querySelectorAll('.metric-value').forEach(el => {
-                              el.style.transform = 'scale(1.1)';
-                              setTimeout(() => el.style.transform = 'scale(1)', 200);
-                          });
-                      }, 500);
+                      const metrics = document.querySelectorAll('.metric-value');
+                      metrics.forEach(metric => {
+                          metric.style.transition = 'all 0.5s ease-out';
+                          metric.style.transform = 'scale(1.1)';
+                          setTimeout(() => {
+                              metric.style.transform = 'scale(1)';
+                          }, 500);
+                      });
                   });
               </script>
           </body>
