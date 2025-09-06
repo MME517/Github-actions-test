@@ -1,374 +1,139 @@
-# .github/workflows/javakotlin.yml
 name: PR Test Analysis Workflow
 
 on:
   workflow_dispatch:
     inputs:
       repo_name:
-        description: 'Repository name (format: owner/repo)'
+        description: "Repository name (e.g. owner/repo)"
         required: true
         type: string
       pr_number:
-        description: 'Pull Request number'
+        description: "Pull Request number"
         required: true
-        type: number
+        type: string
       java_version:
-        description: 'Java version to use (default: 21)'
+        description: "Java version to use"
         required: false
-        default: '21'
-
-permissions:
-  contents: read
-  pull-requests: write
-  checks: write
-  actions: read
-
-concurrency:
-  group: pr-analysis-${{ github.run_id }}
-  cancel-in-progress: false
+        default: "21"
+        type: string
 
 jobs:
   analyze-pr:
-    name: Analyze PR (tests, coverage, mutation, smells)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
-    env:
-      REPO: ${{ inputs.repo_name }}
-      PR: ${{ inputs.pr_number }}
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Install small helpers
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y xmlstarlet jq python3-pip
-          python3 -m pip install --upgrade pip
-
-      - name: Get PR metadata
-        id: pr_info
-        uses: actions/github-script@v6
-        env:
-          INPUT_REPO_NAME: ${{ inputs.repo_name }}
-          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
-        with:
-          script: |
-            const repoName = process.env.INPUT_REPO_NAME;
-            if (!repoName || !repoName.includes('/')) throw new Error('repo_name must be in owner/repo format');
-            const [owner, repo] = repoName.split('/');
-            const prNumber = parseInt(process.env.INPUT_PR_NUMBER, 10);
-            const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-            core.setOutput('base_ref', pr.data.base.ref || '');
-            core.setOutput('base_sha', pr.data.base.sha || '');
-            core.setOutput('head_ref', pr.data.head.ref || '');
-            core.setOutput('head_repo', pr.data.head.repo?.full_name || '');
-            core.setOutput('head_sha', pr.data.head.sha || '');
-            core.setOutput('title', pr.data.title || '');
-
-      - name: Checkout base branch of target repo
+      # Checkout base repo
+      - name: Checkout base repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repo_name }}
-          ref: ${{ steps.pr_info.outputs.base_ref }}
+          repository: ${{ github.event.inputs.repo_name }}
+          path: base
           fetch-depth: 0
 
-      - name: Merge PR branch into base (temporary merge for testing)
-        id: merge_pr
-        env:
-          PR_REMOTE_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ steps.pr_info.outputs.head_repo }}
-          PR_REF: ${{ steps.pr_info.outputs.head_ref }}
+      # Fetch PR test files
+      - name: Fetch PR test files
         run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          echo "Adding PR remote: ${PR_REMOTE_URL}"
-          git remote add prremote "${PR_REMOTE_URL}" || true
+          git clone https://github.com/${{ github.event.inputs.repo_name }} pr_repo
+          cd pr_repo
+          git fetch origin pull/${{ github.event.inputs.pr_number }}/head:pr_branch
+          git checkout pr_branch
+          mkdir -p ../tests
+          rsync -av --include='*/' --include='**/*Test*.java' --include='**/*Test*.kt' --exclude='*' ./ ../tests/
+          cd ..
+          echo "Test files copied to ./tests"
 
-          # Try to fetch PR branch (may be from a fork)
-          if ! git fetch prremote "${PR_REF}" --depth=1; then
-            echo "fetch_failed=true" >> $GITHUB_OUTPUT
-            echo "merged=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Try a no-commit merge so we can run tests on merged state
-          if git merge --no-ff --no-edit FETCH_HEAD; then
-            echo "merge_conflict=false" >> $GITHUB_OUTPUT
-            echo "merged=true" >> $GITHUB_OUTPUT
-          else
-            git merge --abort || true
-            echo "merge_conflict=true" >> $GITHUB_OUTPUT
-            echo "merged=false" >> $GITHUB_OUTPUT
-          fi
-
+      # Install JDK
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          java-version: ${{ github.event.inputs.java_version }}
 
-      - name: Detect build system and run build + tests + analysis
-        id: run_build
+      # Build base repo
+      - name: Build base project
+        working-directory: base
         run: |
-          set -euo pipefail
-          pwd
-
-          detect_tool() {
-            if [ -f "pom.xml" ]; then
-              echo maven
-            elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-              echo gradle
-            else
-              echo unknown
-            fi
-          }
-
-          BUILD_TOOL=$(detect_tool)
-          echo "Detected build tool: $BUILD_TOOL"
-
-          # Ensure analysis directory exists
-          mkdir -p analysis-reports
-
-          # Write a small JSON state file safely (avoid YAML/heredoc pitfalls)
-          MERGED="${{ steps.merge_pr.outputs.merged }}"
-          MERGED=${MERGED:-false}
-          MERGE_CONFLICT="${{ steps.merge_pr.outputs.merge_conflict }}"
-          MERGE_CONFLICT=${MERGE_CONFLICT:-false}
-
-          printf '{"build_tool":"%s","compilation_success":null,"merged":"%s","merge_conflict":"%s"}\n' \
-            "$BUILD_TOOL" "$MERGED" "$MERGE_CONFLICT" \
-            > analysis-reports/analysis_state.json
-
-          COMPILATION_SUCCESS=true
-
-          if [ "$BUILD_TOOL" = "maven" ]; then
-            echo "=== Maven path ==="
-            set +e
-            mvn -B -DskipTests=false -DfailIfNoTests=false clean test
-            BUILD_EXIT=$?
-            set -e
-            if [ $BUILD_EXIT -ne 0 ]; then
-              COMPILATION_SUCCESS=false
-            fi
-
-            # try jacoco (if project configured), PIT, PMD, SpotBugs
-            set +e
-            mvn -B org.jacoco:jacoco-maven-plugin:0.8.8:report || true
-            mvn -B org.pitest:pitest-maven:mutationCoverage || true
-            mvn -B pmd:pmd spotbugs:spotbugs || true
-            set -e
-
-            mkdir -p analysis-reports/maven
-            cp -r target/* analysis-reports/maven/ 2>/dev/null || true
-
-          elif [ "$BUILD_TOOL" = "gradle" ]; then
-            echo "=== Gradle path ==="
-            WRAPPER=./gradlew
-            if [ -f "$WRAPPER" ]; then
-              chmod +x "$WRAPPER" || true
-            fi
-
-            set +e
-            if [ -x "$WRAPPER" ]; then
-              $WRAPPER --no-daemon clean test
-              BUILD_EXIT=$?
-            else
-              gradle clean test
-              BUILD_EXIT=$?
-            fi
-            set -e
-            if [ $BUILD_EXIT -ne 0 ]; then
-              COMPILATION_SUCCESS=false
-            fi
-
-            set +e
-            if [ -x "$WRAPPER" ]; then
-              $WRAPPER --no-daemon jacocoTestReport || true
-              $WRAPPER --no-daemon pitest || true
-              $WRAPPER --no-daemon pmdMain pmdTest spotbugsMain spotbugsTest || true
-            else
-              gradle jacocoTestReport || true
-              gradle pitest || true
-              gradle pmdMain pmdTest spotbugsMain spotbugsTest || true
-            fi
-            set -e
-
-            mkdir -p analysis-reports/gradle
-            cp -r build/* analysis-reports/gradle/ 2>/dev/null || true
-
+          if [ -f "mvnw" ] || [ -f "pom.xml" ]; then
+            ./mvnw clean install -DskipTests || mvn clean install -DskipTests
+          elif [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            ./gradlew build -x test || gradle build -x test
           else
-            echo "No supported build system detected (Maven or Gradle required)."
-            COMPILATION_SUCCESS=false
+            echo "No supported build tool found (Maven/Gradle)." && exit 1
           fi
 
-          # update analysis_state.json with compilation result (use Python to avoid JSON errors)
-          python3 - <<PY
-import json
-p='analysis-reports/analysis_state.json'
-with open(p,'r') as f:
-    s=json.load(f)
-s['compilation_success'] = ${COMPILATION_SUCCESS}
-with open('analysis-reports/analysis_state.json','w') as f:
-    json.dump(s,f,indent=2)
-print('WROTE analysis-reports/analysis_state.json')
-PY
+      # Copy PR tests into base repo
+      - name: Copy PR tests into base repo
+        run: rsync -av ./tests/ ./base/src/test/
 
-      - name: Produce parsed summary (summary.json)
-        id: summarize
+      # Run tests with coverage (JaCoCo)
+      - name: Run Tests with Coverage
+        working-directory: base
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
-import os,glob,json,xml.etree.ElementTree as ET
-summary = {
-  'repo': os.environ.get('REPO',''),
-  'pr': os.environ.get('PR',''),
-  'build_tool': None,
-  'compilation_success': None,
-  'tests': {'tests':0,'failures':0,'errors':0,'skipped':0},
-  'coverage_percent': None,
-  'mutation_score': None,
-  'test_smells': {'pmd':0,'spotbugs':0,'detekt':0},
-}
+          if [ -f "mvnw" ] || [ -f "pom.xml" ]; then
+            ./mvnw test jacoco:report || mvn test jacoco:report
+          else
+            ./gradlew test jacocoTestReport || gradle test jacocoTestReport
+          fi
 
-# read analysis_state if present
-try:
-    with open('analysis-reports/analysis_state.json','r') as f:
-        s = json.load(f)
-        summary['build_tool'] = s.get('build_tool')
-        summary['compilation_success'] = s.get('compilation_success')
-except Exception:
-    pass
+      # Run mutation testing with PIT
+      - name: Run Mutation Tests
+        working-directory: base
+        run: |
+          if [ -f "mvnw" ] || [ -f "pom.xml" ]; then
+            ./mvnw org.pitest:pitest-maven:mutationCoverage || mvn org.pitest:pitest-maven:mutationCoverage
+          else
+            ./gradlew pitest || gradle pitest
+          fi
 
-# Find JUnit/Surefire results
-junit_files = glob.glob('**/surefire-reports/*.xml', recursive=True) + glob.glob('**/test-results/**/*.xml', recursive=True) + glob.glob('**/build/test-results/**/*.xml', recursive=True)
-for fn in set(junit_files):
-    try:
-        tree = ET.parse(fn)
-        root = tree.getroot()
-        if root.tag == 'testsuite':
-            attrs = root.attrib
-            summary['tests']['tests'] += int(attrs.get('tests',0))
-            summary['tests']['failures'] += int(attrs.get('failures',0))
-            summary['tests']['errors'] += int(attrs.get('errors',0))
-            summary['tests']['skipped'] += int(attrs.get('skipped',0))
-        else:
-            for ts in root.findall('.//testsuite'):
-                attrs = ts.attrib
-                summary['tests']['tests'] += int(attrs.get('tests',0))
-                summary['tests']['failures'] += int(attrs.get('failures',0))
-                summary['tests']['errors'] += int(attrs.get('errors',0))
-                summary['tests']['skipped'] += int(attrs.get('skipped',0))
-    except Exception:
-        continue
+      # Detect test smells with TSDetect
+      - name: Install TSDetect
+        run: |
+          curl -L https://github.com/TestSmells/TSDetect/releases/download/v1.0/TSDetect-1.0.jar -o tsdetect.jar
 
-# JaCoCo coverage
-jacoco_files = glob.glob('**/jacoco*.xml', recursive=True) + glob.glob('**/target/site/jacoco/jacoco.xml', recursive=True) + glob.glob('**/build/reports/jacoco/**/*.xml', recursive=True)
-for fn in set(jacoco_files):
-    try:
-        tree = ET.parse(fn)
-        root = tree.getroot()
-        for counter in root.findall('.//counter'):
-            if counter.attrib.get('type') in ('LINE','INSTRUCTION'):
-                missed = int(counter.attrib.get('missed',0))
-                covered = int(counter.attrib.get('covered',0))
-                if (missed+covered) > 0:
-                    pct = covered*100.0/(missed+covered)
-                    summary['coverage_percent'] = round(pct,2)
-                    raise StopIteration
-    except StopIteration:
-        break
-    except Exception:
-        continue
+      - name: Run TSDetect
+        run: |
+          java -jar tsdetect.jar -p ./base/src/test -o ./base/tsdetect-report.json || echo "TSDetect failed"
 
-# PIT mutation (mutations.xml)
-mut_files = glob.glob('**/mutations.xml', recursive=True) + glob.glob('**/target/pit-reports/*/mutations.xml', recursive=True)
-for fn in set(mut_files):
-    try:
-        tree = ET.parse(fn)
-        root = tree.getroot()
-        muts = root.findall('.//mutation')
-        total = len(muts)
-        killed = sum(1 for m in muts if m.attrib.get('detected','false')=='true')
-        if total>0:
-            summary['mutation_score'] = round(killed*100.0/total,2)
-            break
-    except Exception:
-        continue
+      # Collect Results
+      - name: Collect Reports
+        run: |
+          mkdir -p reports
+          find base -name "jacoco.xml" -exec cp {} reports/coverage.xml \; || true
+          find base -name "mutations.xml" -exec cp {} reports/mutation.xml \; || true
+          find base -name "TEST-*.xml" -exec cp {} reports/ \; || true
+          cp base/tsdetect-report.json reports/tsdetect.json || true
 
-# PMD/SpotBugs/Detekt
-pmd_files = glob.glob('**/pmd.xml', recursive=True) + glob.glob('**/build/reports/pmd/**/*.xml', recursive=True)
-for fn in set(pmd_files):
-    try:
-        tree = ET.parse(fn)
-        root = tree.getroot()
-        violations = root.findall('.//violation')
-        summary['test_smells']['pmd'] += len(violations)
-    except Exception:
-        continue
+      # Generate summary
+      - name: Generate Summary
+        run: |
+          echo "## Test Results Summary" > summary.md
+          echo "### Compilation & Execution" >> summary.md
+          echo "- ✅ Build succeeded" >> summary.md
+          echo "### Coverage" >> summary.md
+          if [ -f reports/coverage.xml ]; then
+            COVERAGE=$(xmllint --xpath 'string(//report/counter[@type="INSTRUCTION"]/@covered)' reports/coverage.xml 2>/dev/null || echo "N/A")
+            echo "- Coverage: $COVERAGE instructions covered" >> summary.md
+          else
+            echo "- Coverage: Not available" >> summary.md
+          fi
+          echo "### Mutation Testing" >> summary.md
+          if [ -f reports/mutation.xml ]; then
+            MUT_SCORE=$(xmllint --xpath 'string(//mutationMatrix/@score)' reports/mutation.xml 2>/dev/null || echo "N/A")
+            echo "- Mutation Score: $MUT_SCORE" >> summary.md
+          else
+            echo "- Mutation Score: Not available" >> summary.md
+          fi
+          echo "### Test Smells" >> summary.md
+          if [ -f reports/tsdetect.json ]; then
+            echo "- TSDetect report generated" >> summary.md
+          else
+            echo "- Test Smells: Not available" >> summary.md
+          fi
 
-spot_files = glob.glob('**/spotbugsXml.xml', recursive=True) + glob.glob('**/build/reports/spotbugs/**/*.xml', recursive=True)
-for fn in set(spot_files):
-    try:
-        tree = ET.parse(fn)
-        root = tree.getroot()
-        bugs = root.findall('.//BugInstance')
-        summary['test_smells']['spotbugs'] += len(bugs)
-    except Exception:
-        continue
-
-detekt_files = glob.glob('**/detekt-report.xml', recursive=True) + glob.glob('**/build/reports/detekt/**/*.xml', recursive=True)
-for fn in set(detekt_files):
-    try:
-        tree = ET.parse(fn)
-        root = tree.getroot()
-        issues = root.findall('.//issue')
-        summary['test_smells']['detekt'] += len(issues)
-    except Exception:
-        continue
-
-summary['tests']['passed'] = summary['tests']['tests'] - summary['tests']['failures'] - summary['tests']['errors']
-
-os.makedirs('analysis-reports', exist_ok=True)
-with open('analysis-reports/summary.json','w') as f:
-    json.dump(summary, f, indent=2)
-print('WROTE analysis-reports/summary.json')
-PY
-
-      - name: Upload analysis reports
+      # Upload artifacts
+      - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
-          name: pr-analysis-reports-${{ inputs.pr_number }}
-          path: analysis-reports
-
-      - name: Post summary comment on PR
-        if: always()
-        uses: actions/github-script@v6
-        env:
-          REPO_NAME: ${{ inputs.repo_name }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-        with:
-          script: |
-            const fs = require('fs');
-            const repoName = process.env.REPO_NAME;
-            const [owner, repo] = repoName.split('/');
-            const prNumber = parseInt(process.env.PR_NUMBER, 10);
-            let summary = {};
-            try {
-              summary = JSON.parse(fs.readFileSync('analysis-reports/summary.json','utf8'));
-            } catch (e) {
-              summary = { error: 'could not read summary.json from analysis-reports' };
-            }
-            // Compose a compact, readable markdown comment
-            const md = [
-              '**Automated PR analysis summary**',
-              '',
-              '```json',
-              JSON.stringify(summary, null, 2),
-              '```',
-              '',
-              '_Full reports (coverage, mutation, linting, test results) are attached as an artifact._'
-            ].join('\\n');
-            await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: md });
-
-      - name: Final note
-        if: always()
-        run: |
-          echo "Analysis artifact uploaded: pr-analysis-reports-${{ inputs.pr_number }} (download from workflow run artifacts)."
+          name: pr-analysis-reports
+          path: |
+            reports/
+            summary.md
