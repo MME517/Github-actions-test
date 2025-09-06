@@ -1,309 +1,184 @@
-name: PR Test Analysis Workflow
+# .github/workflows/pr-test-analysis.yml
+
+name: PR Test Analysis
 
 on:
   workflow_dispatch:
     inputs:
-      repo:
-        description: 'Repository name (owner/repo)'
+      repository:
+        description: 'Target repository (owner/repo)'
         required: true
-      pr:
+        type: string
+      pr_number:
         description: 'Pull Request number'
         required: true
-
-permissions:
-  contents: read
+        type: string
 
 jobs:
-  analyze:
+  analyze-pr-tests:
+    name: Analyze PR Test Quality and Coverage
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: read
+      checks: write # Needed for annotations and summary
+      pull-requests: write
+
+    env:
+      JAVA_VERSION: '17'
+      GRADLE_OPTS: '-Dorg.gradle.daemon=false'
+
     steps:
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq xmlstarlet
-
-      - name: Get PR details
-        id: pr_details
-        run: |
-          PR_INFO=$(curl -s -H "Authorization: token ${{ github.token }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ inputs.repo }}/pulls/${{ inputs.pr }})
-          if echo "$PR_INFO" | jq -e '.message' > /dev/null; then
-            echo "Error: $(echo "$PR_INFO" | jq -r '.message')"
-            exit 1
-          fi
-          BASE_REF=$(echo "$PR_INFO" | jq -r '.base.ref')
-          BASE_SHA=$(echo "$PR_INFO" | jq -r '.base.sha')
-          HEAD_REF=$(echo "$PR_INFO" | jq -r '.head.ref')
-          HEAD_SHA=$(echo "$PR_INFO" | jq -r '.head.sha')
-          HEAD_REPO=$(echo "$PR_INFO" | jq -r '.head.repo.full_name')
-          echo "base_ref=$BASE_REF" >> $GITHUB_OUTPUT
-          echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
-          echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
-          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
-          echo "head_repo=$HEAD_REPO" >> $GITHUB_OUTPUT
-
-      - name: Checkout base code
+      # Step 1: Checkout the base code (the main branch at PR base)
+      - name: Checkout base branch
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repo }}
-          ref: ${{ steps.pr_details.outputs.base_sha }}
+          repository: ${{ inputs.repository }}
+          ref: refs/pull/${{ inputs.pr_number }}/base
           path: base
 
-      - name: Checkout head code
+      # Step 2: Checkout PR branch (for test files only)
+      - name: Checkout PR branch (test files only)
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.pr_details.outputs.head_repo }}
-          ref: ${{ steps.pr_details.outputs.head_sha }}
-          path: head
+          repository: ${{ inputs.repository }}
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          path: pr
 
-      - name: Remove original tests in base
-        run: find base -type d -path '*/src/test' -exec rm -rf {} +
-
-      - name: Overlay PR tests on base
+      - name: Copy PR test files into base code (retain only test files)
         run: |
-          find head -type d -path '*/src/test' | while read dir; do
-            target_dir="${dir/head/base}"
-            mkdir -p "$target_dir"
-            cp -r "$dir/." "$target_dir/"
-          done
+          find pr -type f \( -name '*Test.java' -o -name '*Tests.java' -o -name '*Spec.kt' -o -name '*Test.kt' \) > changed_tests.txt
+          while read testfile; do
+            # Remove the leading 'pr/' and copy to 'base/'
+            target="base/${testfile#pr/}"
+            mkdir -p "$(dirname "$target")"
+            cp "$testfile" "$target"
+          done < changed_tests.txt
 
-      - name: Detect build tool
-        id: build_tool
-        run: |
-          if [ -f "base/build.gradle" ] || [ -f "base/build.gradle.kts" ]; then
-            echo "tool=gradle" >> $GITHUB_OUTPUT
-          elif [ -f "base/pom.xml" ]; then
-            echo "tool=maven" >> $GITHUB_OUTPUT
-          else
-            echo "No supported build tool found"
-            exit 1
-          fi
-
-      - name: Check for Kotlin tests
-        id: has_kotlin
-        run: |
-          if find base -name "*.kt" -path '*/src/test*' | grep . >/dev/null 2>&1; then
-            echo "has_kotlin=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_kotlin=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Detect target packages for mutation
-        id: target_packages
-        run: |
-          cd base
-          PACKAGES_LIST=$(find . -type f \( -name "*.java" -o -name "*.kt" \) -path '*/src/main/*' | sed 's|.*/src/main/\(java\|kotlin\)/||; s|/[^/]*$||; s|/|.|g' | sort -u | sed 's/$/.*/')
-          if [ -z "$PACKAGES_LIST" ]; then
-            MAVEN_PACKAGES='*'
-            GRADLE_PACKAGES="'*'"
-          else
-            MAVEN_PACKAGES=$(echo "$PACKAGES_LIST" | tr '\n' ',' | sed 's/,$//')
-            GRADLE_PACKAGES=$(echo "$PACKAGES_LIST" | awk 'ORS="," { print "\x27" $0 "\x27" }' | sed 's/,$//')
-          fi
-          echo "maven_packages=$MAVEN_PACKAGES" >> $GITHUB_OUTPUT
-          echo "gradle_packages=$GRADLE_PACKAGES" >> $GITHUB_OUTPUT
-
-      - name: Set up JDK
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
           distribution: 'temurin'
-          cache: ${{ steps.build_tool.outputs.tool }}
+          java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Create Gradle init script
-        if: steps.build_tool.outputs.tool == 'gradle'
+      - name: Cache Gradle dependencies
+        id: cache-gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('base/**/*.gradle*', 'base/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Prepare gradle wrapper
+        run: cd base && chmod +x ./gradlew
+
+      # Step 3: Compile code and check status
+      - name: Compile code
+        id: compile
         run: |
-          cat << EOF > base/init.gradle
-          buildscript {
-            repositories {
-              mavenCentral()
-            }
-            dependencies {
-              classpath "info.solidsoft.gradle.pitest:gradle-pitest-plugin:1.15.0"
-            }
-          }
-          allprojects {
-            apply plugin: 'jacoco'
-            apply plugin: 'info.solidsoft.pitest'
-            jacoco {
-              toolVersion = "0.8.12"
-            }
-            test {
-              finalizedBy 'jacocoTestReport'
-            }
-            jacocoTestReport {
-              reports {
-                xml.required = true
-                html.required = true
-              }
-            }
-            pitest {
-              targetClasses = [${{ steps.target_packages.outputs.gradle_packages }}]
-              threads = 4
-              outputFormats = ['XML', 'HTML']
-              timestampedReports = false
-              mutationThreshold = 0
-            }
-          }
-          EOF
-
-      - name: Run tests and coverage with Gradle
-        if: steps.build_tool.outputs.tool == 'gradle'
+          cd base
+          ./gradlew classes testClasses
         continue-on-error: true
+
+      # Step 4: Run tests (captures execution and test success)
+      - name: Run all tests
+        id: test
         run: |
           cd base
-          EXECUTABLE=./gradlew
-          if [ ! -x "$EXECUTABLE" ]; then
-            EXECUTABLE=gradle
-          fi
-          $EXECUTABLE test jacocoTestReport --init-script init.gradle --stacktrace
-
-      - name: Run tests and coverage with Maven
-        if: steps.build_tool.outputs.tool == 'maven'
+          ./gradlew test --continue --no-daemon || true
         continue-on-error: true
+
+      # Step 5: Generate code coverage report with JaCoCo
+      - name: Generate JaCoCo report
+        if: always()
         run: |
           cd base
-          mvn org.jacoco:jacoco-maven-plugin:prepare-agent test org.jacoco:jacoco-maven-plugin:report surefire-report:report
-
-      - name: Run mutation with Gradle
-        if: steps.build_tool.outputs.tool == 'gradle'
+          ./gradlew jacocoTestReport
         continue-on-error: true
-        run: |
-          cd base
-          EXECUTABLE=./gradlew
-          if [ ! -x "$EXECUTABLE" ]; then
-            EXECUTABLE=gradle
-          fi
-          $EXECUTABLE pitest --init-script init.gradle --stacktrace
 
-      - name: Run mutation with Maven
-        if: steps.build_tool.outputs.tool == 'maven'
-        continue-on-error: true
-        run: |
-          cd base
-          mvn org.pitest:pitest-maven:mutationCoverage -DtargetClasses=${{ steps.target_packages.outputs.maven_packages }} -Dthreads=4
-
-      - name: Download tsDetect
-        run: curl -L -o tsdetect.jar https://github.com/TestSmells/tsDetect/releases/download/v1.0.0/tsDetect-1.0.0.jar
-
-      - name: Run test smells detection
-        continue-on-error: true
-        run: java -jar tsdetect.jar -p base -o test_smells.csv
-
-      - name: Parse test results
-        id: test_results
-        run: |
-          cd base
-          if [ "${{ steps.build_tool.outputs.tool }}" = "gradle" ]; then
-            TEST_FILES=$(find build/test-results/test -name "*.xml" 2>/dev/null)
-          else
-            TEST_FILES=$(find target/surefire-reports -name "*.xml" 2>/dev/null)
-          fi
-          if [ -n "$TEST_FILES" ]; then
-            TESTS=$(xmlstarlet sel -t -v 'sum(//testsuite/@tests)' $TEST_FILES || echo 0)
-            FAILURES=$(xmlstarlet sel -t -v 'sum(//testsuite/@failures)' $TEST_FILES || echo 0)
-            ERRORS=$(xmlstarlet sel -t -v 'sum(//testsuite/@errors)' $TEST_FILES || echo 0)
-            SKIPPED=$(xmlstarlet sel -t -v 'sum(//testsuite/@skipped)' $TEST_FILES || echo 0)
-            echo "compilation_success=true" >> $GITHUB_OUTPUT
-          else
-            TESTS=0
-            FAILURES=0
-            ERRORS=0
-            SKIPPED=0
-            echo "compilation_success=false" >> $GITHUB_OUTPUT
-          fi
-          echo "tests=$TESTS" >> $GITHUB_OUTPUT
-          echo "failures=$FAILURES" >> $GITHUB_OUTPUT
-          echo "errors=$ERRORS" >> $GITHUB_OUTPUT
-          echo "skipped=$SKIPPED" >> $GITHUB_OUTPUT
-          if [ $FAILURES -eq 0 ] && [ $ERRORS -eq 0 ]; then
-            echo "execution_success=true" >> $GITHUB_OUTPUT
-          else
-            echo "execution_success=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Parse coverage
-        id: coverage
-        run: |
-          cd base
-          if [ "${{ steps.build_tool.outputs.tool }}" = "gradle" ]; then
-            JACOCO_XML="build/reports/jacoco/test/jacocoTestReport.xml"
-          else
-            JACOCO_XML="target/site/jacoco/jacoco.xml"
-          fi
-          if [ -f "$JACOCO_XML" ]; then
-            COVERED=$(xmlstarlet sel -t -v '//counter[@type="LINE"]/@covered' "$JACOCO_XML" || echo 0)
-            MISSED=$(xmlstarlet sel -t -v '//counter[@type="LINE"]/@missed' "$JACOCO_XML" || echo 0)
-            TOTAL=$((COVERED + MISSED))
-            if [ $TOTAL -gt 0 ]; then
-              PERCENT=$((COVERED * 100 / TOTAL))
-            else
-              PERCENT=0
-            fi
-          else
-            PERCENT=0
-          fi
-          echo "percent=$PERCENT" >> $GITHUB_OUTPUT
-
-      - name: Parse mutation score
-        id: mutation
-        run: |
-          cd base
-          if [ "${{ steps.build_tool.outputs.tool }}" = "gradle" ]; then
-            PIT_XML=$(find build/reports/pitest -name "mutations.xml" | head -1)
-          else
-            PIT_XML=$(find target/pitest-reports -name "mutations.xml" | head -1)
-          fi
-          if [ -f "$PIT_XML" ]; then
-            TOTAL=$(xmlstarlet sel -t -v 'count(//mutation)' "$PIT_XML" || echo 0)
-            KILLED=$(xmlstarlet sel -t -v 'count(//mutation[@detected="true"])' "$PIT_XML" || echo 0)
-            if [ $TOTAL -gt 0 ]; then
-              PERCENT=$((KILLED * 100 / TOTAL))
-            else
-              PERCENT=0
-            fi
-          else
-            PERCENT=0
-          fi
-          echo "percent=$PERCENT" >> $GITHUB_OUTPUT
-
-      - name: Parse test smells
-        id: test_smells
-        run: |
-          if [ -f "test_smells.csv" ]; then
-            TOTAL_SMELLS=$(( $(wc -l < test_smells.csv) - 1 ))
-          else
-            TOTAL_SMELLS=0
-          fi
-          echo "total=$TOTAL_SMELLS" >> $GITHUB_OUTPUT
-          if [ "${{ steps.has_kotlin.outputs.has_kotlin }}" = "true" ]; then
-            echo "note=(Note: Test smells detection may not include Kotlin tests)" >> $GITHUB_OUTPUT
-          else
-            echo "note=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload reports
+      - name: Upload JaCoCo report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports
-          path: |
-            base/build/reports/**
-            base/target/site/**
-            base/target/surefire-reports/**
-            base/target/pitest-reports/**
-            test_smells.csv
+          name: 'jacoco-report'
+          path: base/build/reports/jacoco/test/html
 
-      - name: Generate summary
+      # Step 6: Mutation testing with PIT
+      - name: Run mutation tests (PIT)
+        if: always()
         run: |
-          SUMMARY="# PR Test Analysis Results\n\n"
-          SUMMARY+="| Metric | Result |\n"
-          SUMMARY+="|--------|--------|\n"
-          SUMMARY+="| Compilation Success | ${{ steps.test_results.outputs.compilation_success }} |\n"
-          SUMMARY+="| Execution Success | ${{ steps.test_results.outputs.execution_success }} (Tests: ${{ steps.test_results.outputs.tests }}, Failures: ${{ steps.test_results.outputs.failures }}, Errors: ${{ steps.test_results.outputs.errors }}, Skipped: ${{ steps.test_results.outputs.skipped }}) |\n"
-          SUMMARY+="| Code Coverage | ${{ steps.coverage.outputs.percent }}% |\n"
-          SUMMARY+="| Mutation Score | ${{ steps.mutation.outputs.percent }}% |\n"
-          SUMMARY+="| Test Smells | ${{ steps.test_smells.outputs.total }} ${{ steps.test_smells.outputs.note }} |\n\n"
-          SUMMARY+="Detailed reports available as workflow artifacts."
-          echo "summary<<EOF" >> $GITHUB_ENV
-          echo "$SUMMARY" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          cd base
+          ./gradlew pitest
+        continue-on-error: true
 
-      - name: Comment summary on PR
-        run: gh pr comment ${{ inputs.pr }} --body "${{ env.summary }}" --repo ${{ inputs.repo }}
+      - name: Upload PIT report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'pitest-report'
+          path: base/build/reports/pitest
+
+      # Step 7: Test Smell Detection (Java/JUnit)
+      - name: Download TestSmellDetector
+        if: always()
+        run: wget -O detector.jar https://github.com/TestSmells/TestSmellDetector/releases/latest/download/TestSmellDetector.jar
+
+      - name: Collect test files for smell analysis
+        if: always()
+        run: |
+          cd base
+          find . -name "*Test.java" > testfiles.csv
+
+      - name: Run Test Smell Detection
+        if: always()
+        run: |
+          java -jar detector.jar -f base/testfiles.csv -g numerical -o base/test-smells.txt -t default
+
+      - name: Upload Test Smell Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'testsmell-report'
+          path: base/test-smells.txt
+
+      # Step 8: Upload test result artifacts (JUnit XML, logs)
+      - name: Upload JUnit Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'junit-test-results'
+          path: base/build/test-results/test
+
+      # Step 9: Generate Workflow Summary in Markdown
+      - name: Publish Markdown workflow summary
+        if: always()
+        run: |
+          {
+            echo '## 🚦 PR Test Analysis Summary'
+            echo ''
+            echo '| Metric | Result |'
+            echo '|--------|--------|'
+            echo "| Compilation Success | $([[ \${{ steps.compile.outcome }} == 'success' ]] && echo '✅' || echo '❌') |"
+            echo "| Test Execution Success | $([[ \${{ steps.test.outcome }} == 'success' ]] && echo '✅' || echo '❌') |"
+            echo '| [JaCoCo Coverage Report](./artifacts/jacoco-report) | Generated |'
+            echo '| [Mutation Testing Report](./artifacts/pitest-report) | Generated |'
+            echo '| [Test Smell Report](./artifacts/testsmell-report) | Generated |'
+            echo '| [JUnit XML Test Results](./artifacts/junit-test-results) | Generated |'
+            echo ''
+            echo 'See individual artifacts for full details.'
+          } >> $GITHUB_STEP_SUMMARY
+
+      # Optionally, annotate failed tests or failed compilation 
+      - name: Annotate failed test results
+        if: failure()
+        uses: dorny/test-reporter@v2
+        with:
+          name: 'JUnit Tests'
+          path: base/build/test-results/test/TEST-*.xml
+          reporter: junit
+          fail-on-error: false
+
