@@ -59,36 +59,43 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
-          # Removed cache parameter to avoid errors
 
       - name: Setup Kotlin
         uses: fwilhe2/setup-kotlin@v1
         with:
           version: ${{ env.KOTLIN_VERSION }}
 
-      - name: Cache dependencies
-        id: cache-deps
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            ~/.m2/repository
-          key: ${{ runner.os }}-${{ hashFiles('**/build.gradle', '**/build.gradle.kts', '**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-            ${{ runner.os }}-maven-
-
       - name: Get PR information
         id: pr_info
         run: |
-          PR_DATA=$(gh api repos/${{ github.event.inputs.repo_name }}/pulls/${{ github.event.inputs.pr_number }})
+          echo "Fetching PR information for #${{ github.event.inputs.pr_number }}"
+          
+          # Try to get PR data with error handling
+          PR_DATA=$(gh api repos/${{ github.event.inputs.repo_name }}/pulls/${{ github.event.inputs.pr_number }} 2>/dev/null)
+          
+          if [ $? -ne 0 ] || [ -z "$PR_DATA" ]; then
+            echo "❌ Failed to fetch PR data. Please check:"
+            echo "   - PR number: #${{ github.event.inputs.pr_number }}"
+            echo "   - Repository: ${{ github.event.inputs.repo_name }}"
+            echo "   - Permissions: Make sure the token has access to the repository"
+            exit 1
+          fi
+          
           BASE_SHA=$(echo "$PR_DATA" | jq -r '.base.sha')
           HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
           BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.base.ref')
+          HEAD_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
+          
           echo "base_sha=$BASE_SHA" >> $GITHUB_OUTPUT
           echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
           echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+          echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
+          
+          echo "✅ PR information retrieved:"
+          echo "   - Base SHA: $BASE_SHA"
+          echo "   - Head SHA: $HEAD_SHA"
+          echo "   - Base Branch: $BASE_BRANCH"
+          echo "   - Head Ref: $HEAD_REF"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -97,17 +104,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.repo_name }}
-          ref: ${{ steps.pr_info.outputs.base_branch || 'main' }}
+          ref: ${{ steps.pr_info.outputs.base_branch }}
           path: base-repo
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Checkout PR repository
+      - name: Checkout PR branch
         id: checkout-pr
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.repo_name }}
-          ref: refs/pull/${{ github.event.inputs.pr_number }}/merge
+          ref: ${{ steps.pr_info.outputs.head_sha }}
           path: pr-repo
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -330,17 +337,17 @@ jobs:
         run: |
           echo "📈 Computing metrics for summary report..."
           
+          # Set default values
+          COMPILATION_TIME="${steps.compile_base.outputs.compilation_time:-0}"
+          TEST_TIME="${steps.run_tests.outputs.test_time:-0}"
+          TOTAL_TIME=$((COMPILATION_TIME + TEST_TIME))
+          
           # Calculate success rate
           if [ "${{ steps.run_tests.outputs.tests_run }}" != "0" ] && [ -n "${{ steps.run_tests.outputs.tests_run }}" ]; then
             SUCCESS_RATE=$(echo "scale=2; ${{ steps.run_tests.outputs.tests_passed }} * 100 / ${{ steps.run_tests.outputs.tests_run }}" | bc)
           else
             SUCCESS_RATE="0"
           fi
-          
-          # Calculate total analysis time with defaults
-          COMPILATION_TIME="${steps.compile_base.outputs.compilation_time:-0}"
-          TEST_TIME="${steps.run_tests.outputs.test_time:-0}"
-          TOTAL_TIME=$((COMPILATION_TIME + TEST_TIME))
           
           echo "success_rate=$SUCCESS_RATE" >> $GITHUB_OUTPUT
           echo "total_time=$TOTAL_TIME" >> $GITHUB_OUTPUT
@@ -357,7 +364,7 @@ jobs:
           LINE_COVERAGE="${steps.coverage.outputs.line_coverage:-0.00}"
           BRANCH_COVERAGE="${steps.coverage.outputs.branch_coverage:-0.00}"
           MUTATION_SCORE="${steps.mutation.outputs.mutation_score:-0}"
-          TOTAL_SMELLS="${steps.test_smells.outputs.total_smeels:-0}"
+          TOTAL_SMELLS="${steps.test_smells.outputs.total_smells:-0}"
           
           cat > summary_report.md << EOF
           # PR Test Analysis Summary Report
@@ -485,18 +492,31 @@ jobs:
           
           echo "✅ Summary report generated successfully"
 
+      - name: Prepare artifacts for upload
+        if: always()
+        run: |
+          echo "📦 Preparing artifacts for upload..."
+          mkdir -p artifacts
+          
+          # Copy all relevant files to artifacts directory
+          [ -f summary_report.md ] && cp summary_report.md artifacts/
+          [ -f test_smells.json ] && cp test_smells.json artifacts/
+          [ -f compile_base.log ] && cp compile_base.log artifacts/
+          [ -f test_execution.log ] && cp test_execution.log artifacts/
+          [ -f mutation.log ] && cp mutation.log artifacts/
+          
+          # Copy reports directory if it exists
+          [ -d reports ] && cp -r reports artifacts/
+          
+          echo "Contents of artifacts directory:"
+          ls -la artifacts/
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-analysis-reports
-          path: |
-            reports/
-            summary_report.md
-            test_smells.json
-            compile_base.log
-            test_execution.log
-            mutation.log
+          path: artifacts/
           retention-days: 30
 
       - name: Upload coverage reports
@@ -554,8 +574,8 @@ jobs:
             - **Tests Run:** ${{ steps.run_tests.outputs.tests_run }}
             - **Tests Passed:** ${{ steps.run_tests.outputs.tests_passed }}
             - **Tests Failed:** ${{ steps.run_tests.outputs.tests_failed }}
-            - **Line Coverage:** ${{ steps.coverage.outputs.line_coverage }}%
-            - **Branch Coverage:** ${{ steps.coverage.outputs.branch_coverage }}%
+            - **Line Coverage:** ${process.env.LINE_COVERAGE || 'N/A'}%
+            - **Branch Coverage:** ${process.env.BRANCH_COVERAGE || 'N/A'}%
             - **Mutation Score:** ${{ steps.mutation.outputs.mutation_score }}%
             - **Test Smells:** ${{ steps.test_smells.outputs.total_smells }}
             `;
@@ -602,295 +622,9 @@ jobs:
           else
             echo "✅ Analysis completed successfully!"
             echo "   - Tests passed: ${{ steps.run_tests.outputs.tests_passed }}/${{ steps.run_tests.outputs.tests_run }}"
-            echo "   - Coverage: ${{ steps.coverage.outputs.line_coverage }}%"
+            echo "   - Coverage: ${LINE_COVERAGE}%"
             echo "   - Mutation score: ${{ steps.mutation.outputs.mutation_score }}%"
           fi
           echo ""
           echo "📊 Full reports available in workflow artifacts"
           echo "========================================="
-
-  # Separate job for generating detailed HTML report
-  generate-html-report:
-    needs: analyze-pr
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-      
-      - name: Generate HTML report
-        run: |
-          # Extract data from summary report
-          LINE_COVERAGE=$(grep -oP 'Line Coverage.*\|\s*\K[0-9.]+' artifacts/summary_report.md 2>/dev/null || echo "0")
-          BRANCH_COVERAGE=$(grep -oP 'Branch Coverage.*\|\s*\K[0-9.]+' artifacts/summary_report.md 2>/dev/null || echo "0")
-          TESTS_PASSED=$(grep -oP 'Tests Passed.*\|\s*\K[0-9]+' artifacts/summary_report.md 2>/dev/null || echo "0")
-          TESTS_RUN=$(grep -oP 'Total Tests Run.*\|\s*\K[0-9]+' artifacts/summary_report.md 2>/dev/null || echo "0")
-          MUTATION_SCORE=$(grep -oP 'Mutation Score.*\|\s*\K[0-9.]+' artifacts/summary_report.md 2>/dev/null || echo "0")
-          TOTAL_SMELLS=$(grep -oP 'Total Smells.*\|\s*\*\*[0-9]+\*\*' artifacts/summary_report.md | grep -oP '[0-9]+' 2>/dev/null || echo "0")
-          
-          # Calculate success percentage
-          if [ "$TESTS_RUN" -gt 0 ]; then
-            SUCCESS_PERCENTAGE=$((TESTS_PASSED * 100 / TESTS_RUN))
-          else
-            SUCCESS_PERCENTAGE=0
-          fi
-          
-          cat > index.html << EOF
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-              <meta charset="UTF-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>PR Test Analysis Report</title>
-              <style>
-                  * { margin: 0; padding: 0; box-sizing: border-box; }
-                  body {
-                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                      min-height: 100vh;
-                      padding: 20px;
-                  }
-                  .container {
-                      max-width: 1200px;
-                      margin: 0 auto;
-                      background: white;
-                      border-radius: 20px;
-                      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                      overflow: hidden;
-                  }
-                  .header {
-                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                      color: white;
-                      padding: 40px;
-                      text-align: center;
-                  }
-                  .header h1 {
-                      font-size: 2.5em;
-                      margin-bottom: 10px;
-                  }
-                  .header p {
-                      opacity: 0.9;
-                      font-size: 1.1em;
-                  }
-                  .content {
-                      padding: 40px;
-                  }
-                  .metrics-grid {
-                      display: grid;
-                      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                      gap: 20px;
-                      margin-bottom: 40px;
-                  }
-                  .metric-card {
-                      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-                      padding: 20px;
-                      border-radius: 10px;
-                      text-align: center;
-                      transition: transform 0.3s;
-                  }
-                  .metric-card:hover {
-                      transform: translateY(-5px);
-                  }
-                  .metric-value {
-                      font-size: 2.5em;
-                      font-weight: bold;
-                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                      -webkit-background-clip: text;
-                      -webkit-text-fill-color: transparent;
-                  }
-                  .metric-label {
-                      color: #666;
-                      margin-top: 10px;
-                  }
-                  .section {
-                      margin-bottom: 40px;
-                  }
-                  .section h2 {
-                      color: #333;
-                      border-bottom: 3px solid #667eea;
-                      padding-bottom: 10px;
-                      margin-bottom: 20px;
-                  }
-                  table {
-                      width: 100%;
-                      border-collapse: collapse;
-                  }
-                  th, td {
-                      padding: 12px;
-                      text-align: left;
-                      border-bottom: 1px solid #eee;
-                  }
-                  th {
-                      background: #f8f9fa;
-                      font-weight: 600;
-                      color: #667eea;
-                  }
-                  .status-badge {
-                      display: inline-block;
-                      padding: 4px 12px;
-                      border-radius: 20px;
-                      font-size: 0.9em;
-                      font-weight: 600;
-                  }
-                  .status-success { background: #10b981; color: white; }
-                  .status-failure { background: #ef4444; color: white; }
-                  .status-warning { background: #f59e0b; color: white; }
-                  .progress-bar {
-                      width: 100%;
-                      height: 30px;
-                      background: #f3f4f6;
-                      border-radius: 15px;
-                      overflow: hidden;
-                      position: relative;
-                  }
-                  .progress-fill {
-                      height: 100%;
-                      background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-                      transition: width 0.5s;
-                      display: flex;
-                      align-items: center;
-                      justify-content: center;
-                      color: white;
-                      font-weight: bold;
-                  }
-                  .chart-container {
-                      width: 100%;
-                      height: 300px;
-                      margin: 20px 0;
-                  }
-                  .footer {
-                      background: #f8f9fa;
-                      padding: 20px;
-                      text-align: center;
-                      color: #666;
-                  }
-              </style>
-          </head>
-          <body>
-              <div class="container">
-                  <div class="header">
-                      <h1>🔬 PR Test Analysis Report</h1>
-                      <p>Comprehensive testing and quality analysis</p>
-                  </div>
-                  
-                  <div class="content">
-                      <div class="metrics-grid">
-                          <div class="metric-card">
-                              <div class="metric-value">$TESTS_PASSED/$TESTS_RUN</div>
-                              <div class="metric-label">Tests Passed</div>
-                          </div>
-                          <div class="metric-card">
-                              <div class="metric-value">${LINE_COVERAGE}%</div>
-                              <div class="metric-label">Code Coverage</div>
-                          </div>
-                          <div class="metric-card">
-                              <div class="metric-value">${MUTATION_SCORE}%</div>
-                              <div class="metric-label">Mutation Score</div>
-                          </div>
-                          <div class="metric-card">
-                              <div class="metric-value">$TOTAL_SMELLS</div>
-                              <div class="metric-label">Test Smells</div>
-                          </div>
-                      </div>
-                      
-                      <div class="section">
-                          <h2>📊 Test Results</h2>
-                          <div class="progress-bar">
-                              <div class="progress-fill" style="width: ${SUCCESS_PERCENTAGE}%">${SUCCESS_PERCENTAGE}%</div>
-                          </div>
-                      </div>
-                      
-                      <div class="section">
-                          <h2>📈 Coverage Analysis</h2>
-                          <table>
-                              <thead>
-                                  <tr>
-                                      <th>Coverage Type</th>
-                                      <th>Percentage</th>
-                                      <th>Status</th>
-                                  </tr>
-                              </thead>
-                              <tbody>
-                                  <tr>
-                                      <td>Line Coverage</td>
-                                      <td>${LINE_COVERAGE}%</td>
-                                      <td><span class="status-badge $([[ $(echo "$LINE_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "status-success" || ([[ $(echo "$LINE_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "status-warning" || echo "status-failure")) ">$([[ $(echo "$LINE_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "Good" || ([[ $(echo "$LINE_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "Fair" || echo "Poor"))</span></td>
-                                  </tr>
-                                  <tr>
-                                      <td>Branch Coverage</td>
-                                      <td>${BRANCH_COVERAGE}%</td>
-                                      <td><span class="status-badge $([[ $(echo "$BRANCH_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "status-success" || ([[ $(echo "$BRANCH_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "status-warning" || echo "status-failure")) ">$([[ $(echo "$BRANCH_COVERAGE >= 80" | bc -l) -eq 1 ]] && echo "Good" || ([[ $(echo "$BRANCH_COVERAGE >= 60" | bc -l) -eq 1 ]] && echo "Fair" || echo "Poor"))</span></td>
-                                  </tr>
-                              </tbody>
-                          </table>
-                      </div>
-                      
-                      <div class="section">
-                          <h2>🔍 Code Quality</h2>
-                          <table>
-                              <thead>
-                                  <tr>
-                                      <th>Test Smell</th>
-                                      <th>Count</th>
-                                      <th>Severity</th>
-                                  </tr>
-                              </thead>
-                              <tbody>
-                                  <!-- Smells data would be populated here -->
-                                  <tr>
-                                      <td colspan="3" style="text-align: center;">Detailed smell analysis available in the test reports</td>
-                                  </tr>
-                              </tbody>
-                          </table>
-                      </div>
-                  </div>
-                  
-                  <div class="footer">
-                      <p>Generated by GitHub Actions Workflow • © 2024</p>
-                  </div>
-              </div>
-              
-              <script>
-                  // Animation for metrics
-                  document.addEventListener('DOMContentLoaded', function() {
-                      const metrics = document.querySelectorAll('.metric-value');
-                      metrics.forEach(metric => {
-                          metric.style.transition = 'all 0.5s ease-out';
-                          metric.style.transform = 'scale(1.1)';
-                          setTimeout(() => {
-                              metric.style.transform = 'scale(1)';
-                          }, 500);
-                      });
-                  });
-              </script>
-          </body>
-          </html>
-          EOF
-          
-          echo "✅ HTML report generated"
-
-      - name: Upload HTML report
-        uses: actions/upload-artifact@v4
-        with:
-          name: html-report
-          path: index.html
-          retention-days: 30
-
-      - name: Display workflow summary
-        run: |
-          echo "## 📋 Workflow Execution Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Analysis | ✅ Completed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Reports Generated | ✅ Success |" >> $GITHUB_STEP_SUMMARY
-          echo "| Artifacts Uploaded | ✅ Success |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Available Artifacts:" >> $GITHUB_STEP_SUMMARY
-          echo "- Test Analysis Reports" >> $GITHUB_STEP_SUMMARY
-          echo "- Coverage Reports" >> $GITHUB_STEP_SUMMARY
-          echo "- Mutation Reports" >> $GITHUB_STEP_SUMMARY
-          echo "- HTML Summary Report" >> $GITHUB_STEP_SUMMARY
