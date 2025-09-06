@@ -141,10 +141,9 @@ jobs:
 
       - name: Setup Maven
         if: steps.detect_build.outputs.build_system == 'maven'
-        run: |
-          wget -q https://dlcdn.apache.org/maven/maven-3/${{ env.MAVEN_VERSION }}/binaries/apache-maven-${{ env.MAVEN_VERSION }}-bin.tar.gz
-          tar xzf apache-maven-${{ env.MAVEN_VERSION }}-bin.tar.gz
-          echo "$PWD/apache-maven-${{ env.MAVEN_VERSION }}/bin" >> $GITHUB_PATH
+        uses: stCarolas/setup-maven@v4
+        with:
+          maven-version: ${{ env.MAVEN_VERSION }}
 
       - name: Identify changed test files
         id: changed_tests
@@ -338,12 +337,20 @@ jobs:
           echo "📈 Computing metrics for summary report..."
           
           # Set default values
-          COMPILATION_TIME="${steps.compile_base.outputs.compilation_time:-0}"
-          TEST_TIME="${steps.run_tests.outputs.test_time:-0}"
+          COMPILATION_TIME="${{ steps.compile_base.outputs.compilation_time }}"
+          if [ -z "$COMPILATION_TIME" ]; then
+            COMPILATION_TIME=0
+          fi
+          
+          TEST_TIME="${{ steps.run_tests.outputs.test_time }}"
+          if [ -z "$TEST_TIME" ]; then
+            TEST_TIME=0
+          fi
+          
           TOTAL_TIME=$((COMPILATION_TIME + TEST_TIME))
           
           # Calculate success rate
-          if [ "${{ steps.run_tests.outputs.tests_run }}" != "0" ] && [ -n "${{ steps.run_tests.outputs.tests_run }}" ]; then
+          if [ -n "${{ steps.run_tests.outputs.tests_run }}" ] && [ "${{ steps.run_tests.outputs.tests_run }}" != "0" ]; then
             SUCCESS_RATE=$(echo "scale=2; ${{ steps.run_tests.outputs.tests_passed }} * 100 / ${{ steps.run_tests.outputs.tests_run }}" | bc)
           else
             SUCCESS_RATE="0"
@@ -361,10 +368,25 @@ jobs:
           echo "📊 Generating summary report..."
           
           # Set default values for variables that might be empty
-          LINE_COVERAGE="${steps.coverage.outputs.line_coverage:-0.00}"
-          BRANCH_COVERAGE="${steps.coverage.outputs.branch_coverage:-0.00}"
-          MUTATION_SCORE="${steps.mutation.outputs.mutation_score:-0}"
-          TOTAL_SMELLS="${steps.test_smells.outputs.total_smells:-0}"
+          LINE_COVERAGE="${{ steps.coverage.outputs.line_coverage }}"
+          if [ -z "$LINE_COVERAGE" ]; then
+            LINE_COVERAGE="0.00"
+          fi
+          
+          BRANCH_COVERAGE="${{ steps.coverage.outputs.branch_coverage }}"
+          if [ -z "$BRANCH_COVERAGE" ]; then
+            BRANCH_COVERAGE="0.00"
+          fi
+          
+          MUTATION_SCORE="${{ steps.mutation.outputs.mutation_score }}"
+          if [ -z "$MUTATION_SCORE" ]; then
+            MUTATION_SCORE="0"
+          fi
+          
+          TOTAL_SMELLS="${{ steps.test_smells.outputs.total_smells }}"
+          if [ -z "$TOTAL_SMELLS" ]; then
+            TOTAL_SMELLS="0"
+          fi
           
           cat > summary_report.md << EOF
           # PR Test Analysis Summary Report
